@@ -25,6 +25,8 @@ from fraud_agents.shared import config, signing
 from fraud_agents.shared.cards import card_token
 from fraud_agents.shared.bus import stream_for
 from fraud_agents.shared.events import (
+    CustomerReplied,
+    CustomerRepliedPayload,
     TransactionReceived,
     TransactionReceivedPayload,
     derived_event_id,
@@ -83,6 +85,7 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     app.state.secret = config.require("WEBHOOK_SECRET")
     app.state.token_key = config.require("CARD_TOKEN_KEY")
+    app.state.sms_secret = config.require("SMS_WEBHOOK_SECRET")
     app.state.redis = aioredis.Redis.from_url(
         os.environ.get("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True
     )
@@ -134,3 +137,52 @@ async def receive_payment(request: Request):
     await r.set(seen_key, 1, ex=SEEN_TTL_SECONDS)
     log.info("Accepted txn %s  $%s  %s", payment.trans_num[:8], payment.amt, payment.category)
     return {"status": "accepted", "txn_id": payment.trans_num, "event_id": event.event_id}
+
+
+# ---------- Customers' text replies (Part 2 · Step 5) ----------
+
+class IncomingSmsReply(BaseModel):
+    """What the SMS provider sends when a customer replies to one of our texts."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    message_id: str = Field(min_length=1)
+    from_: str = Field(min_length=1, alias="from")
+    text: str = Field(min_length=1, max_length=500)
+    in_reply_to: str = Field(min_length=1)      # the provider's ID of our outgoing text
+    reference: str = Field(min_length=1)         # our verification.requested event_id
+    txn_id: str = Field(min_length=1)
+
+
+@app.post("/webhooks/sms-replies", status_code=202)
+async def receive_sms_reply(request: Request):
+    body = await request.body()
+    if not signing.verify(request.app.state.sms_secret, request.headers.get("X-Timestamp"),
+                          request.headers.get("X-Signature"), body):
+        log.warning("Refused SMS reply: bad or missing signature")
+        raise HTTPException(status_code=401, detail="bad or missing signature")
+    try:
+        reply = IncomingSmsReply.model_validate_json(body)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail=str(error)[:500])
+
+    r = request.app.state.redis
+    seen_key = f"gateway:sms-seen:{reply.message_id}"
+    if await r.exists(seen_key):
+        return JSONResponse({"status": "duplicate"}, status_code=200)
+
+    event = CustomerReplied(
+        # Built from the provider's message ID, so a resent webhook is spotted as a duplicate.
+        event_id=derived_event_id(reply.message_id, "sms-gateway"),
+        published_at=now_utc(),
+        txn_id=reply.txn_id,
+        occurred_at=now_utc(),
+        payload=CustomerRepliedPayload(
+            card_id=reply.from_, reply_text=reply.text,
+            message_id=reply.message_id, in_reply_to=reply.reference,
+        ),
+    )
+    await r.xadd(stream_for(event.event_type), {"event": event.model_dump_json()})
+    await r.set(seen_key, 1, ex=SEEN_TTL_SECONDS)
+    log.info("Customer reply for txn %s: %r", reply.txn_id[:8], reply.text)
+    return {"status": "accepted", "event_id": event.event_id}
