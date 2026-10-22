@@ -12,6 +12,7 @@ Every agent reads its input stream as a member of a consumer group, so:
 import logging
 import os
 import socket
+import time
 from collections.abc import Callable
 
 import redis
@@ -25,10 +26,15 @@ DEAD_LETTER_STREAM = "events:dead"
 MAX_DELIVERIES = 3            # tries before an event goes to the dead-letter stream
 RECLAIM_AFTER_MS = 60_000     # an event unfinished for 60 s is picked up again
 SEEN_TTL_SECONDS = 7 * 24 * 3600
+ALIVE_TTL_SECONDS = 15        # the "I'm alive" note expires if the agent stops
 
 
 def stream_for(event_type: str) -> str:
     return f"events:{event_type}"
+
+
+def alive_key(group: str, stream: str) -> str:
+    return f"alive:{group}:{stream}"
 
 
 def connect() -> redis.Redis:
@@ -96,33 +102,49 @@ def consume(
     handled = 0
     while stop_after is None or handled < stop_after:
         try:
-            # 1. Pick up events another copy left unfinished (e.g. it crashed).
-            _, claimed, _ = r.xautoclaim(stream, group, consumer, RECLAIM_AFTER_MS, "0-0", count=10)
-            # 2. Then read new events, waiting up to block_ms for one to arrive.
-            batch = claimed
-            if not batch:
-                reply = r.xreadgroup(group, consumer, {stream: ">"}, count=10, block=block_ms)
-                batch = reply[0][1] if reply else []
-        except redis.ResponseError as error:
-            if "NOGROUP" not in str(error) and "UNBLOCKED" not in str(error):
-                raise
-            ensure_group(r, stream, group)  # the stream was deleted (e.g. Redis was reset)
-            continue
+            handled += _one_round(r, stream, group, handler, consumer, block_ms,
+                                  None if stop_after is None else stop_after - handled)
+        except (redis.ConnectionError, redis.TimeoutError) as error:
+            # Redis is restarting or unreachable: wait and try again; nothing is lost,
+            # because unacknowledged events stay in the stream.
+            log.warning("Redis unavailable (%s); retrying in 2 s", error)
+            time.sleep(2)
+    return handled
 
-        for entry_id, fields in batch:
-            info = r.xpending_range(stream, group, entry_id, entry_id, 1)
-            tries = info[0]["times_delivered"] if info else 1
-            if tries > MAX_DELIVERIES:
-                # It keeps coming back (e.g. it crashed the whole agent): stop retrying it.
-                _dead_letter(r, stream, group, entry_id, fields, f"delivered {tries} times")
-                continue
-            try:
-                _handle(r, stream, group, entry_id, fields, handler)
-                handled += 1
-            except Exception as error:  # left un-acknowledged, so it will be retried
-                log.exception("Failed on %s (try %d)", entry_id, tries)
-                if tries >= MAX_DELIVERIES:
-                    _dead_letter(r, stream, group, entry_id, fields, f"failed {tries} times: {error}")
-            if stop_after is not None and handled >= stop_after:
-                break
+
+def _one_round(r, stream, group, handler, consumer, block_ms, limit) -> int:
+    """Read one batch and handle it. Returns how many events were handled."""
+    handled = 0
+    # A short-lived "I'm alive" note that the System Monitor reads.
+    r.set(alive_key(group, stream), consumer, ex=ALIVE_TTL_SECONDS)
+    try:
+        # 1. Pick up events another copy left unfinished (e.g. it crashed).
+        _, claimed, _ = r.xautoclaim(stream, group, consumer, RECLAIM_AFTER_MS, "0-0", count=10)
+        # 2. Then read new events, waiting up to block_ms for one to arrive.
+        batch = claimed
+        if not batch:
+            reply = r.xreadgroup(group, consumer, {stream: ">"}, count=10, block=block_ms)
+            batch = reply[0][1] if reply else []
+    except redis.ResponseError as error:
+        if "NOGROUP" not in str(error) and "UNBLOCKED" not in str(error):
+            raise
+        ensure_group(r, stream, group)  # the stream was deleted (e.g. Redis was reset)
+        return 0
+
+    for entry_id, fields in batch:
+        info = r.xpending_range(stream, group, entry_id, entry_id, 1)
+        tries = info[0]["times_delivered"] if info else 1
+        if tries > MAX_DELIVERIES:
+            # It keeps coming back (e.g. it crashed the whole agent): stop retrying it.
+            _dead_letter(r, stream, group, entry_id, fields, f"delivered {tries} times")
+            continue
+        try:
+            _handle(r, stream, group, entry_id, fields, handler)
+            handled += 1
+        except Exception as error:  # left un-acknowledged, so it will be retried
+            log.exception("Failed on %s (try %d)", entry_id, tries)
+            if tries >= MAX_DELIVERIES:
+                _dead_letter(r, stream, group, entry_id, fields, f"failed {tries} times: {error}")
+        if limit is not None and handled >= limit:
+            break
     return handled

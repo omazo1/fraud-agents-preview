@@ -17,6 +17,8 @@ dependencies = [
     "fastapi>=0.159,<1",
     "uvicorn>=0.54,<1",
     "httpx>=0.28,<1",
+    "streamlit>=1.66,<2",
+    "psycopg[binary]>=3.3,<4",
 ]
 
 [tool.setuptools.packages.find]
