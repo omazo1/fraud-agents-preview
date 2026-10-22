@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Annotated, Literal, Union
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -16,6 +16,16 @@ def now_utc() -> datetime:
 def new_event_id() -> str:
     """A fresh random ID for a new event."""
     return str(uuid4())
+
+
+def derived_event_id(source_event_id: str, producer: str) -> str:
+    """The ID for an event an agent makes in reply to another event.
+
+    It is the same every time for the same input event and agent, so if an agent
+    retries after a crash, the form it publishes again has the same ID and the
+    next agent can spot the duplicate.
+    """
+    return str(uuid5(NAMESPACE_URL, f"fraud-agents/{producer}/{source_event_id}"))
 
 
 class Form(BaseModel):
