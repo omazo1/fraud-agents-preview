@@ -217,12 +217,28 @@ class CaseEscalated(Envelope):
     payload: CaseEscalatedPayload
 
 
+# ---------- Form 11: "a human reviewed the case" (the analyst, from the Monitor's Analyst page) ----------
+
+class CaseReviewedPayload(Form):
+    decision: Literal["release", "block"]
+    analyst: str = Field(min_length=1, max_length=60)
+    note: str | None = Field(default=None, max_length=300)
+    based_on_event_id: str = Field(min_length=1)    # the transaction.resolved (sent_to_analyst) event_id
+
+
+class CaseReviewed(Envelope):
+    event_type: Literal["case.reviewed"] = "case.reviewed"
+    producer: Literal["analyst"] = "analyst"
+    payload: CaseReviewedPayload
+
+
 # ---------- Any of the forms (for readers of every type, e.g. the audit log) ----------
 
 ALL_EVENTS = (
     TransactionReceived, RiskScored, TransactionDecided,
     InvestigationCompleted, VerificationRequested, CustomerReplied,
     VerificationCompleted, TransactionResolved, NotificationSent, CaseEscalated,
+    CaseReviewed,
 )
 EVENT_TYPES = [form.model_fields["event_type"].default for form in ALL_EVENTS]
 
@@ -315,6 +331,9 @@ if __name__ == "__main__":
             used_template=False, based_on_event_id=decided.event_id))),
         CaseEscalated(**label(producer="investigation", payload=CaseEscalatedPayload(
             reason="Report failed the checks twice", based_on_event_id=decided.event_id))),
+        CaseReviewed(**label(payload=CaseReviewedPayload(
+            decision="release", analyst="demo analyst", note="Known shop for this customer",
+            based_on_event_id=decided.event_id))),
     ]
     for form in part2:
         assert parse_event(form.model_dump_json()) == form
@@ -323,7 +342,7 @@ if __name__ == "__main__":
         derived_event_id("x", "investigation", "case.escalated")
     # Part 1 IDs are unchanged when event_type is not given.
     assert derived_event_id("x", "decision") == str(uuid5(NAMESPACE_URL, "fraud-agents/decision/x"))
-    print(f"3b. Part 2 forms: {len(part2)} OK ({', '.join(f.event_type for f in part2)})")
+    print(f"3b. Part 2 and 3 forms: {len(part2)} OK ({', '.join(f.event_type for f in part2)})")
 
     try:
         TransactionDecidedPayload(

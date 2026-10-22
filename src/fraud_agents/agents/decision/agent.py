@@ -7,6 +7,9 @@
    investigation.completed, case.escalated) and publishes transaction.resolved:
    released, blocked or sent_to_analyst. The rules live in resolution_rules_v1.json.
    The AI agents only advise; this is where the outcome is decided.
+3. Analyst override (Part 3 · Step 1): reads case.reviewed (Release / Block clicked on the
+   Monitor's Analyst page) and publishes a new transaction.resolved that replaces a
+   sent_to_analyst outcome. Only a case that is still waiting for a human can be changed.
 
 Run from the project folder:  python -m fraud_agents.agents.decision.agent
 Stop it with Ctrl + C.
@@ -23,6 +26,7 @@ from pathlib import Path
 from fraud_agents.shared import bus, db
 from fraud_agents.shared.events import (
     CaseEscalated,
+    CaseReviewed,
     InvestigationCompleted,
     RiskScored,
     TransactionDecided,
@@ -85,6 +89,8 @@ def resolve(event, rules: dict, first_decision=first_decision_of) -> Transaction
     """The final outcome for one slow-lane result, by plain rules. None = nothing to decide."""
     if isinstance(event, VerificationCompleted):
         resolution, rule_id = rules["verification"][event.payload.outcome]
+    elif isinstance(event, CaseReviewed):
+        resolution, rule_id = rules["analyst"][event.payload.decision]
     elif isinstance(event, CaseEscalated):
         resolution, rule_id = rules["escalation"]
     elif isinstance(event, InvestigationCompleted):
@@ -135,20 +141,40 @@ def main() -> None:
         if resolved is None:
             return
         # One final outcome per payment: the first one wins (SET NX), later ones are ignored.
-        if not r.set(f"resolved:{event.txn_id}", resolved.event_id, nx=True):
+        # A retry of the winner finds its own ID there and publishes again (same ID: readers skip it).
+        key = f"resolved:{event.txn_id}"
+        if not r.set(key, resolved.event_id, nx=True) and r.get(key) != resolved.event_id:
             log.info("txn %s  already has a final outcome: %s ignored", event.txn_id[:8], event.event_type)
             return
-        try:
-            bus.publish(r, resolved)
-        except Exception:
-            r.delete(f"resolved:{event.txn_id}")   # let the retry through
-            raise
+        bus.publish(r, resolved)
         log.info("txn %s  FINAL: %-15s (%s, from %s)", event.txn_id[:8],
                  resolved.payload.resolution.upper(), resolved.payload.rule_id, event.event_type)
 
+    def handle_review(event):
+        if not isinstance(event, CaseReviewed):
+            raise ValueError(f"Expected case.reviewed, got {event.event_type}")
+        resolved = resolve(event, resolution_rules)
+        key = f"resolved:{event.txn_id}"
+        if r.get(key) != resolved.event_id:   # not a retry of a review already applied
+            # Swap the final outcome only if it is still the sent_to_analyst one being reviewed.
+            with r.pipeline() as pipe:
+                pipe.watch(key)
+                if pipe.get(key) != event.payload.based_on_event_id:
+                    pipe.unwatch()
+                    log.warning("txn %s  analyst review ignored: the case is not waiting for an analyst",
+                                event.txn_id[:8])
+                    return
+                pipe.multi()
+                pipe.set(key, resolved.event_id)
+                pipe.execute()                 # raises WatchError if it changed meanwhile: retried
+        bus.publish(r, resolved)               # a retry publishes the same ID again; readers skip it
+        log.info("txn %s  FINAL (analyst %s): %-8s (%s)", event.txn_id[:8], event.payload.analyst,
+                 resolved.payload.resolution.upper(), resolved.payload.rule_id)
+
     host = f"{socket.gethostname()}-{os.getpid()}"
     streams = [("risk.scored", handle), ("verification.completed", handle_result),
-               ("investigation.completed", handle_result), ("case.escalated", handle_result)]
+               ("investigation.completed", handle_result), ("case.escalated", handle_result),
+               ("case.reviewed", handle_review)]
     threads = []
     for stream, handler in streams:
         t = threading.Thread(target=bus.consume, daemon=True, name=stream, args=(

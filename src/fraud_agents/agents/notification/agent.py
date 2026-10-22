@@ -57,6 +57,9 @@ OUTCOMES = {
     "released": ("we checked the payment, it looks normal, and it is approved", "approved"),
     "sent_to_analyst": ("a member of our fraud team is reviewing the payment and will contact you",
                         "review"),
+    "blocked/analyst_blocked": ("our fraud team reviewed the payment and blocked it to protect your card",
+                                "blocked"),
+    "released/analyst_released": ("our fraud team reviewed the payment and it is approved", "approved"),
 }
 
 TEMPLATES = {
@@ -68,6 +71,10 @@ TEMPLATES = {
                 "don't need to do anything.",
     "sent_to_analyst": "Bank: our fraud team is reviewing the ${amount} payment at {merchant} "
                        "and will contact you soon.",
+    "blocked/analyst_blocked": "Bank: our fraud team reviewed the ${amount} payment at {merchant} "
+                               "and blocked it. Your card is now protected.",
+    "released/analyst_released": "Bank: our fraud team reviewed the ${amount} payment at {merchant}. "
+                                 "It is approved, and you don't need to do anything.",
 }
 
 FORBIDDEN = re.compile(r"(https?://|www\.|\bpin\b|password|card number|\bcvv\b|click)", re.IGNORECASE)
@@ -172,6 +179,11 @@ def main() -> None:
     def handle(event):
         if not isinstance(event, TransactionResolved):
             raise ValueError(f"Expected transaction.resolved, got {event.event_type}")
+        current = r.get(f"resolved:{event.txn_id}")   # the Decision agent's current final outcome
+        if current and current != event.event_id:
+            log.info("txn %s  %s skipped: a later outcome replaced it (e.g. an analyst's decision)",
+                     event.txn_id[:8], event.payload.resolution)
+            return
         p = payment_details(event.txn_id)
         start = time.time()
         sent_key = f"notification:sent:{event.event_id}"
