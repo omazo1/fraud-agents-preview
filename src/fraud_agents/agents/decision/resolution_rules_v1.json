@@ -1,0 +1,16 @@
+{
+  "rules_version": "resolution_v1",
+  "verification": {
+    "denied_by_customer": ["blocked", "customer_denied"],
+    "confirmed_by_customer": ["released", "customer_confirmed"],
+    "unclear": ["sent_to_analyst", "customer_reply_unclear"],
+    "no_reply": ["sent_to_analyst", "no_customer_reply"]
+  },
+  "investigation": {
+    "escalate_to_analyst": ["sent_to_analyst", "investigator_escalated"],
+    "no_further_action_after_flag": ["released", "investigator_cleared_flagged_payment"],
+    "no_further_action_after_hold": ["sent_to_analyst", "held_payment_needs_human_release"]
+  },
+  "escalation": ["sent_to_analyst", "case_escalated"],
+  "note": "Final outcomes (Part 2 Step 6). The AI never releases a HELD payment on its own: that needs the customer's YES or a human."
+}
