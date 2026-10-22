@@ -48,6 +48,7 @@ def connect() -> psycopg.Connection:
         password=config.require("POSTGRES_PASSWORD"),
         dbname=config.require("POSTGRES_DB"),
         autocommit=True,
+        options="-c TimeZone=UTC",  # all times come back in UTC, like everywhere else
     )
 
 

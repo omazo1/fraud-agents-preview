@@ -10,8 +10,6 @@ Run from the project folder:
     uvicorn fraud_agents.services.gateway.app:app --port 8000
 """
 
-import hashlib
-import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -24,6 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from fraud_agents.shared import config, signing
+from fraud_agents.shared.cards import card_token
 from fraud_agents.shared.bus import stream_for
 from fraud_agents.shared.events import (
     TransactionReceived,
@@ -55,16 +54,6 @@ class IncomingPayment(BaseModel):
     city_pop: int = Field(ge=0)
     merch_lat: float
     merch_long: float
-
-
-def card_token(cc_num: str, key: str) -> str:
-    """A stand-in for the card number, so the real number never travels in an event.
-
-    Keyed with a secret (HMAC), so nobody can work back to the card number by
-    trying every possible number.
-    """
-    digest = hmac.new(key.encode(), cc_num.encode(), hashlib.sha256).hexdigest()
-    return "card-" + digest[:16]
 
 
 def to_event(p: IncomingPayment, token_key: str) -> TransactionReceived:
