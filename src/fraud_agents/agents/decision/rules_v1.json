@@ -1,0 +1,6 @@
+{
+  "rules_version": "rules_v1",
+  "hold_at": 0.9,
+  "flag_at": 0.5,
+  "note": "Lines chosen 2026-10-22 from the Step 4 test results. Change these numbers (and rules_version) to move the lines; no code change needed."
+}
