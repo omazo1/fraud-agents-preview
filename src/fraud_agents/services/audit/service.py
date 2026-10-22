@@ -17,9 +17,9 @@ import time
 import psycopg
 
 from fraud_agents.shared import bus, db
+from fraud_agents.shared.events import EVENT_TYPES  # every form, Part 1 and Part 2
 
 GROUP = "audit"
-EVENT_TYPES = ["transaction.received", "risk.scored", "transaction.decided"]
 
 INSERT = """
 INSERT INTO events (event_id, event_type, txn_id, producer, occurred_at, published_at,
@@ -44,7 +44,9 @@ class Recorder:
         row = (
             event.event_id, event.event_type, event.txn_id, event.producer,
             event.occurred_at, event.published_at,
-            getattr(payload, "score", None), getattr(payload, "decision", None),
+            getattr(payload, "score", None),
+            getattr(payload, "decision", None) or getattr(payload, "resolution", None)
+            or getattr(payload, "verdict", None) or getattr(payload, "outcome", None),
             event.model_dump_json(),
         )
         wait = 1

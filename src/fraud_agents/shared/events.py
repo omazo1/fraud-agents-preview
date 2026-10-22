@@ -18,14 +18,18 @@ def new_event_id() -> str:
     return str(uuid4())
 
 
-def derived_event_id(source_event_id: str, producer: str) -> str:
+def derived_event_id(source_event_id: str, producer: str, event_type: str | None = None) -> str:
     """The ID for an event an agent makes in reply to another event.
 
-    It is the same every time for the same input event and agent, so if an agent
-    retries after a crash, the form it publishes again has the same ID and the
-    next agent can spot the duplicate.
+    It is the same every time for the same input event, agent and form type, so if an
+    agent retries after a crash, the form it publishes again has the same ID and the
+    next agent can spot the duplicate. Pass event_type when one agent can publish
+    more than one kind of form from the same input (e.g. a report OR an escalation).
     """
-    return str(uuid5(NAMESPACE_URL, f"fraud-agents/{producer}/{source_event_id}"))
+    key = f"fraud-agents/{producer}/{source_event_id}"
+    if event_type:
+        key += f"/{event_type}"
+    return str(uuid5(NAMESPACE_URL, key))
 
 
 class Form(BaseModel):
@@ -100,16 +104,133 @@ class TransactionDecided(Envelope):
     payload: TransactionDecidedPayload
 
 
-# ---------- Any of the three forms (for readers of every type, e.g. the audit log) ----------
+# =====================================================================
+# Part 2 forms: the slow lane (investigation, customer check, outcome)
+# =====================================================================
 
-AnyEvent = Annotated[
-    Union[TransactionReceived, RiskScored, TransactionDecided],
-    Field(discriminator="event_type"),
-]
+# ---------- Form 4: "I investigated it" (the Investigation agent, an LLM) ----------
+
+class InvestigationCompletedPayload(Form):
+    verdict: Literal["likely_fraud", "likely_genuine", "unsure"]
+    summary: str = Field(min_length=10, max_length=1000)
+    evidence: list[str] = Field(default_factory=list, max_length=6)
+    tools_used: list[str] = Field(default_factory=list)
+    recommended_action: Literal["verify_with_customer", "escalate_to_analyst", "no_further_action"]
+    model: str
+    based_on_event_id: str = Field(min_length=1)
+
+
+class InvestigationCompleted(Envelope):
+    event_type: Literal["investigation.completed"] = "investigation.completed"
+    producer: Literal["investigation"] = "investigation"
+    payload: InvestigationCompletedPayload
+
+
+# ---------- Form 5: "I asked the customer" (the Verification agent) ----------
+
+class VerificationRequestedPayload(Form):
+    """The event_id of this form is the verification's reference: the customer's
+    reply comes back with it (in_reply_to), so it is matched to exactly this case."""
+
+    card_id: str = Field(min_length=1)
+    channel: Literal["sms"] = "sms"
+    message: str = Field(min_length=1, max_length=480)
+    based_on_event_id: str = Field(min_length=1)
+
+
+class VerificationRequested(Envelope):
+    event_type: Literal["verification.requested"] = "verification.requested"
+    producer: Literal["verification"] = "verification"
+    payload: VerificationRequestedPayload
+
+
+# ---------- Form 6: "the customer replied" (arrives as a webhook from the SMS provider) ----------
+
+class CustomerRepliedPayload(Form):
+    card_id: str = Field(min_length=1)
+    reply_text: str = Field(min_length=1, max_length=500)
+    message_id: str = Field(min_length=1)           # the SMS provider's ID for this reply
+    in_reply_to: str = Field(min_length=1)          # the verification.requested event_id
+
+
+class CustomerReplied(Envelope):
+    event_type: Literal["customer.replied"] = "customer.replied"
+    producer: Literal["sms-gateway"] = "sms-gateway"
+    payload: CustomerRepliedPayload
+
+
+# ---------- Form 7: "the customer check is finished" (the Verification agent) ----------
+
+class VerificationCompletedPayload(Form):
+    outcome: Literal["confirmed_by_customer", "denied_by_customer", "unclear", "no_reply"]
+    reply_text: str | None = None
+    based_on_event_id: str = Field(min_length=1)    # the verification.requested event_id
+
+
+class VerificationCompleted(Envelope):
+    event_type: Literal["verification.completed"] = "verification.completed"
+    producer: Literal["verification"] = "verification"
+    payload: VerificationCompletedPayload
+
+
+# ---------- Form 8: "final outcome" (the Decision agent's rules again: rules decide) ----------
+
+class TransactionResolvedPayload(Form):
+    resolution: Literal["released", "blocked", "sent_to_analyst"]
+    rule_id: str
+    rules_version: str
+    based_on_event_id: str = Field(min_length=1)
+
+
+class TransactionResolved(Envelope):
+    event_type: Literal["transaction.resolved"] = "transaction.resolved"
+    producer: Literal["decision"] = "decision"
+    payload: TransactionResolvedPayload
+
+
+# ---------- Form 9: "I told the customer" (the Notification agent) ----------
+
+class NotificationSentPayload(Form):
+    card_id: str = Field(min_length=1)
+    channel: Literal["sms"] = "sms"
+    message: str = Field(min_length=1, max_length=480)
+    used_template: bool          # True = the AI draft failed the checks, so the safe template was sent
+    based_on_event_id: str = Field(min_length=1)
+
+
+class NotificationSent(Envelope):
+    event_type: Literal["notification.sent"] = "notification.sent"
+    producer: Literal["notification"] = "notification"
+    payload: NotificationSentPayload
+
+
+# ---------- Form 10: "a human must look at this" (any agent) ----------
+
+class CaseEscalatedPayload(Form):
+    reason: str = Field(min_length=5, max_length=500)
+    based_on_event_id: str = Field(min_length=1)
+
+
+class CaseEscalated(Envelope):
+    event_type: Literal["case.escalated"] = "case.escalated"
+    producer: Literal["investigation", "verification", "notification", "decision"]
+    payload: CaseEscalatedPayload
+
+
+# ---------- Any of the forms (for readers of every type, e.g. the audit log) ----------
+
+ALL_EVENTS = (
+    TransactionReceived, RiskScored, TransactionDecided,
+    InvestigationCompleted, VerificationRequested, CustomerReplied,
+    VerificationCompleted, TransactionResolved, NotificationSent, CaseEscalated,
+)
+EVENT_TYPES = [form.model_fields["event_type"].default for form in ALL_EVENTS]
+
+AnyEvent = Annotated[Union[ALL_EVENTS], Field(discriminator="event_type")]
 _any_event = TypeAdapter(AnyEvent)
 
 
-def parse_event(text: str) -> TransactionReceived | RiskScored | TransactionDecided:
+def parse_event(text: str):
     """Read a form from text (as stored in Redis); event_type picks the right form."""
     return _any_event.validate_json(text)
 
@@ -165,6 +286,44 @@ if __name__ == "__main__":
     )
     assert parse_event(decided.model_dump_json()) == decided
     print("3. Decided form: OK")
+
+    # The Part 2 forms: build one of each and read it back from text.
+    def label(**kw):
+        return dict(event_id=new_event_id(), published_at=now_utc(), txn_id=received.txn_id,
+                    occurred_at=when, **kw)
+
+    part2 = [
+        InvestigationCompleted(**label(payload=InvestigationCompletedPayload(
+            verdict="likely_fraud", summary="Large online purchase at night, far above usual.",
+            evidence=["amount 30x the card's average"], tools_used=["card_history"],
+            recommended_action="verify_with_customer", model="demo",
+            based_on_event_id=decided.event_id))),
+        VerificationRequested(**label(payload=VerificationRequestedPayload(
+            card_id="card-demo-1", message="Did you just pay $4.97 at Rippin? Reply YES or NO.",
+            based_on_event_id=decided.event_id))),
+        CustomerReplied(**label(payload=CustomerRepliedPayload(
+            card_id="card-demo-1", reply_text="NO that wasn't me", message_id="sms-1",
+            in_reply_to="demo-verification-id"))),
+        VerificationCompleted(**label(payload=VerificationCompletedPayload(
+            outcome="denied_by_customer", reply_text="NO that wasn't me",
+            based_on_event_id=decided.event_id))),
+        TransactionResolved(**label(payload=TransactionResolvedPayload(
+            resolution="blocked", rule_id="customer_denied", rules_version="demo",
+            based_on_event_id=decided.event_id))),
+        NotificationSent(**label(payload=NotificationSentPayload(
+            card_id="card-demo-1", message="We blocked a payment on your card.",
+            used_template=False, based_on_event_id=decided.event_id))),
+        CaseEscalated(**label(producer="investigation", payload=CaseEscalatedPayload(
+            reason="Report failed the checks twice", based_on_event_id=decided.event_id))),
+    ]
+    for form in part2:
+        assert parse_event(form.model_dump_json()) == form
+    # One agent, one input, two kinds of form -> two different IDs.
+    assert derived_event_id("x", "investigation", "investigation.completed") != \
+        derived_event_id("x", "investigation", "case.escalated")
+    # Part 1 IDs are unchanged when event_type is not given.
+    assert derived_event_id("x", "decision") == str(uuid5(NAMESPACE_URL, "fraud-agents/decision/x"))
+    print(f"3b. Part 2 forms: {len(part2)} OK ({', '.join(f.event_type for f in part2)})")
 
     try:
         TransactionDecidedPayload(

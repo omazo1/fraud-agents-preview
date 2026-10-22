@@ -19,6 +19,7 @@ import redis
 import streamlit as st
 
 from fraud_agents.shared import bus, db
+from fraud_agents.shared.events import EVENT_TYPES as ALL_TYPES
 
 GATEWAY_HEALTH = "http://localhost:8000/health"
 REPLAY_LOG = Path("data/processed/replay_from_monitor.log")
@@ -27,7 +28,6 @@ AGENTS = [  # (name on the board, consumer group, the stream it reads)
     ("Risk Scoring agent", "risk-scoring", "transaction.received"),
     ("Decision agent", "decision", "risk.scored"),
 ]
-ALL_TYPES = ["transaction.received", "risk.scored", "transaction.decided"]
 
 st.set_page_config(page_title="Fraud System Monitor", layout="wide")
 
