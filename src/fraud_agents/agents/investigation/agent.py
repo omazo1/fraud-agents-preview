@@ -31,6 +31,7 @@ import argparse
 import json
 import logging
 import operator
+import re
 import time
 from typing import Annotated, Literal
 
@@ -118,8 +119,9 @@ def check(report: InvestigationReport, tools_used: list[str]) -> list[str]:
         problems.append("give between 1 and 5 pieces of evidence")
     if any(len(e) > 250 for e in report.evidence):
         problems.append("each piece of evidence must be one short sentence")
-    if report.verdict == "likely_fraud" and report.recommended_action == "no_further_action":
-        problems.append("a likely_fraud verdict cannot have no_further_action")
+    if report.verdict != "likely_genuine" and report.recommended_action == "no_further_action":
+        problems.append(f"the verdict {report.verdict} cannot have no_further_action "
+                        "(only likely_genuine can)")
     if len(set(tools_used)) < 2:
         problems.append("the investigation used fewer than 2 different tools")
     return problems
@@ -254,6 +256,69 @@ def investigate(graph, txn_id: str, logger: LLMCallLogger) -> dict:
     )
 
 
+def give_up(r, event, reason: str) -> None:
+    """The investigation failed every try (e.g. the AI or a tool is down): hand it to a human.
+
+    Without this, a flagged or held payment would be set aside with no final outcome."""
+    if not (isinstance(event, TransactionDecided) and event.payload.decision in ("flag", "hold")):
+        return
+    bus.publish(r, CaseEscalated(
+        event_id=derived_event_id(event.event_id, PRODUCER, "case.escalated"),
+        published_at=now_utc(), txn_id=event.txn_id, occurred_at=event.occurred_at, producer=PRODUCER,
+        payload=CaseEscalatedPayload(
+            reason=f"The investigation could not finish ({reason[:300]}), so a human must decide.",
+            based_on_event_id=event.event_id)))
+    log.warning("txn %s  investigation gave up: ESCALATED to a human", event.txn_id[:8])
+
+
+NUMBER = re.compile(r"(?<![\w.])\$?(\d[\d,]*(?:\.\d+)?)(%?)")
+LONG_ID = re.compile(r"\b(?:card-)?[0-9a-f]{16,}\b")   # txn and card IDs are not facts to check
+
+
+def tool_numbers(messages) -> list[float]:
+    """Every number the tools (and the payment's facts) gave the AI."""
+    texts = [str(m.content) for m in messages
+             if isinstance(m, ToolMessage) or (isinstance(m, HumanMessage) and "Facts:" in str(m.content))]
+    found = NUMBER.findall(LONG_ID.sub(" ", " ".join(texts)))
+    return [float(n.replace(",", "")) for n, _ in found]
+
+
+def ungrounded_numbers(report: dict, messages) -> list[str]:
+    """Numbers in the report that no tool gave (allowing rounding, and 0.0141 = 1.41%)."""
+    source = tool_numbers(messages)
+    text = LONG_ID.sub(" ", " ".join([report["summary"], *report["evidence"]]))
+    missing = []
+    for raw, percent in NUMBER.findall(text):
+        value = float(raw.replace(",", ""))
+        places = len(raw.split(".")[1]) if "." in raw else 0
+        candidates = source + ([s * 100 for s in source] if percent else [])
+        if not any(abs(round(c, places) - value) < 1e-9 for c in candidates):
+            missing.append(raw + percent)
+    return missing
+
+
+def guard_action(report: dict, messages) -> tuple[str, str | None]:
+    """'no_further_action' releases a flagged payment without asking anyone, so the AI may
+    choose it only with a likely_genuine verdict, every piece of evidence stating a number,
+    and every number in its report traced to the tools. Otherwise the customer is asked
+    instead (Part 3 · Step 3). This can't prove the AI's reasoning right; it only stops
+    unchecked claims from releasing a payment on their own."""
+    action = report["recommended_action"]
+    if action != "no_further_action":
+        return action, None
+    if report["verdict"] != "likely_genuine":
+        return "verify_with_customer", f"verdict {report['verdict']}"
+    # Every piece of evidence must be a checkable number from the tools; facts in words only
+    # ("shopped here weekly for years") can't be checked, so they can't release a payment.
+    wordy = [e for e in report["evidence"] if not NUMBER.search(LONG_ID.sub(" ", e))]
+    if wordy:
+        return "verify_with_customer", "evidence without a checkable number: " + "; ".join(wordy)[:200]
+    missing = ungrounded_numbers(report, messages)
+    if missing:
+        return "verify_with_customer", "numbers not found in the tool results: " + ", ".join(missing[:5])
+    return action, None
+
+
 def to_event(decided: TransactionDecided, result: dict, model: str):
     if result["problems"] or not result["report"]:
         return CaseEscalated(
@@ -266,13 +331,17 @@ def to_event(decided: TransactionDecided, result: dict, model: str):
                 based_on_event_id=decided.event_id),
         )
     r = result["report"]
+    action, why = guard_action(r, result.get("messages", []))
+    if why:
+        log.warning("txn %s  AI suggested no_further_action, changed to %s (%s)",
+                    decided.txn_id[:8], action, why)
     return InvestigationCompleted(
         event_id=derived_event_id(decided.event_id, PRODUCER, "investigation.completed"),
         published_at=now_utc(), txn_id=decided.txn_id, occurred_at=decided.occurred_at,
         payload=InvestigationCompletedPayload(
             verdict=r["verdict"], summary=r["summary"][:1000], evidence=r["evidence"][:6],
             tools_used=list(dict.fromkeys(result["tools_used"])),
-            recommended_action=r["recommended_action"], model=model,
+            recommended_action=action, model=model,
             based_on_event_id=decided.event_id),
     )
 
@@ -338,7 +407,8 @@ def main() -> None:
     source = bus.stream_for("transaction.decided")
     log.info("Listening on %s (group %s) with %s. Press Ctrl + C to stop.", source, GROUP, model_name(model))
     try:
-        bus.consume(r, source, GROUP, handle, batch_size=1, reclaim_after_ms=SLOW_RECLAIM_MS)
+        bus.consume(r, source, GROUP, handle, batch_size=1, reclaim_after_ms=SLOW_RECLAIM_MS,
+                    on_give_up=lambda event, reason: give_up(r, event, reason))
     except KeyboardInterrupt:
         log.info("Stopped.")
 

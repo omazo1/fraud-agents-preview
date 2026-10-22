@@ -12,6 +12,7 @@
     "no_further_action_after_hold": ["sent_to_analyst", "held_payment_needs_human_release"]
   },
   "escalation": ["sent_to_analyst", "case_escalated"],
+  "gave_up": ["sent_to_analyst", "decision_could_not_finish"],
   "analyst": {
     "release": ["released", "analyst_released"],
     "block": ["blocked", "analyst_blocked"]

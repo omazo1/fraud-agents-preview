@@ -85,6 +85,26 @@ def first_decision_of(decided_event_id: str) -> str | None:
     return row[0] if row else None
 
 
+def is_analyst_case(outcome_event_id: str, txn_id: str) -> bool:
+    """True only if this event is a sent_to_analyst final outcome for this payment.
+
+    Raises if the audit log hasn't recorded it yet, so the review is tried again later."""
+    with db.connect() as conn:
+        row = conn.execute("SELECT txn_id, decision FROM events WHERE event_id = %s "
+                           "AND event_type = 'transaction.resolved'", (outcome_event_id,)).fetchone()
+    if row is None:
+        raise RuntimeError("the reviewed outcome is not in the audit log (yet)")
+    return row[0] == txn_id and row[1] == "sent_to_analyst"
+
+
+def latest_outcome_id(txn_id: str) -> str | None:
+    """The newest final outcome of a payment, from the audit log."""
+    with db.connect() as conn:
+        row = conn.execute("SELECT event_id FROM events WHERE txn_id = %s AND event_type = "
+                           "'transaction.resolved' ORDER BY published_at DESC LIMIT 1", (txn_id,)).fetchone()
+    return row[0] if row else None
+
+
 def resolve(event, rules: dict, first_decision=first_decision_of) -> TransactionResolved | None:
     """The final outcome for one slow-lane result, by plain rules. None = nothing to decide."""
     if isinstance(event, VerificationCompleted):
@@ -136,6 +156,23 @@ def main() -> None:
 
     resolution_rules = json.loads(RESOLUTION_FILE.read_text())
 
+    def give_up_result(event, reason: str) -> None:
+        """A slow-lane result could not be decided after every try: send it to a human,
+        so a flagged or held payment never ends without an outcome (Part 3 · Step 3)."""
+        if not isinstance(event, (VerificationCompleted, InvestigationCompleted, CaseEscalated)):
+            return
+        resolution, rule_id = resolution_rules["gave_up"]
+        resolved = TransactionResolved(   # its own ID: never the same as a normal outcome's
+            event_id=derived_event_id(event.event_id, PRODUCER, "transaction.resolved/gave_up"),
+            published_at=now_utc(), txn_id=event.txn_id, occurred_at=event.occurred_at,
+            payload=TransactionResolvedPayload(resolution=resolution, rule_id=rule_id,
+                                               rules_version=resolution_rules["rules_version"],
+                                               based_on_event_id=event.event_id))
+        key = f"resolved:{event.txn_id}"
+        if r.set(key, resolved.event_id, nx=True) or r.get(key) == resolved.event_id:
+            bus.publish(r, resolved)
+            log.warning("txn %s  could not decide (%s): SENT_TO_ANALYST", event.txn_id[:8], reason[:120])
+
     def handle_result(event):
         resolved = resolve(event, resolution_rules)
         if resolved is None:
@@ -155,7 +192,18 @@ def main() -> None:
             raise ValueError(f"Expected case.reviewed, got {event.event_type}")
         resolved = resolve(event, resolution_rules)
         key = f"resolved:{event.txn_id}"
+        if r.get(key) != resolved.event_id and r.get(key) != event.payload.based_on_event_id \
+                and latest_outcome_id(event.txn_id) == event.payload.based_on_event_id:
+            # The Redis note was lost (e.g. Redis was reset), but the audit log shows the case
+            # is still waiting for a human: restore the note instead of ignoring the review.
+            r.set(key, event.payload.based_on_event_id)
         if r.get(key) != resolved.event_id:   # not a retry of a review already applied
+            # The review must point at a "sent to an analyst" outcome of this same payment:
+            # an analyst can't flip a payment the rules already blocked or released.
+            if not is_analyst_case(event.payload.based_on_event_id, event.txn_id):
+                log.warning("txn %s  analyst review ignored: it doesn't point at a sent_to_analyst "
+                            "outcome of this payment", event.txn_id[:8])
+                return
             # Swap the final outcome only if it is still the sent_to_analyst one being reviewed.
             with r.pipeline() as pipe:
                 pipe.watch(key)
@@ -179,7 +227,8 @@ def main() -> None:
     for stream, handler in streams:
         t = threading.Thread(target=bus.consume, daemon=True, name=stream, args=(
             bus.connect(), bus.stream_for(stream), GROUP, handler),
-            kwargs={"consumer": f"{host}-{stream}"})
+            kwargs={"consumer": f"{host}-{stream}",
+                    "on_give_up": None if stream in ("risk.scored", "case.reviewed") else give_up_result})
         t.start()
         threads.append(t)
     log.info(

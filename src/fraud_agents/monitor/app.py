@@ -37,6 +37,7 @@ SMS_HEALTH = "http://localhost:8100/health"
 REPLAY_LOG = Path("data/processed/replay_from_monitor.log")
 ANSWER_KEY_FILE = Path("data/raw/fraudTest.csv")
 SMS_LOG = "sms:log"   # the mock SMS provider's record of every text in and out
+RUN_KEY = "monitor:run"   # the current run: when it started, and each agent's count at that moment
 
 AGENTS = [  # (name on the board, consumer group, the streams it reads)
     ("Risk Scoring", "risk-scoring", ["transaction.received"]),
@@ -91,11 +92,88 @@ def service_up(url: str) -> bool:
         return False
 
 
-def agent_info(r, group: str, streams: list[str]) -> dict:
-    """An agent's totals over every stream it reads; running only if it reads all of them."""
+def agent_info(r, group: str, streams: list[str], run: dict | None = None) -> dict:
+    """An agent's totals over every stream it reads; running only if it reads all of them.
+
+    With a run, 'handled' counts from the run's start; 'waiting' is always the live queue."""
     parts = [group_info(r, t, group) for t in streams]
-    return {"handled": sum(x["handled"] for x in parts), "waiting": sum(x["waiting"] for x in parts),
+    start = sum(int((run or {}).get(f"base:{group}:{t}", 0)) for t in streams)
+    return {"handled": max(0, sum(x["handled"] for x in parts) - start),
+            "waiting": sum(x["waiting"] for x in parts),
             "running": all(x["running"] for x in parts)}
+
+
+# ---------- Runs: counters from zero, and a clock (Part 3 · Step 3) ----------
+
+def start_run(r, label: str, planned: int = 0) -> None:
+    """Mark the start of a new run: remember the time and every agent's count right now."""
+    base = {f"base:{group}:{t}": group_info(r, t, group)["handled"]
+            for _, group, streams in AGENTS for t in streams}
+    r.delete(RUN_KEY)
+    r.hset(RUN_KEY, mapping={"started_at": now_utc().isoformat(), "label": label,
+                             "planned": planned, **base})
+
+
+def current_run(r) -> dict | None:
+    run = r.hgetall(RUN_KEY)
+    if not run:
+        return None
+    run["started_at"] = datetime.fromisoformat(run["started_at"])
+    run["planned"] = int(run.get("planned") or 0)
+    return run
+
+
+def in_run(run: dict | None) -> tuple[str, tuple]:
+    """SQL that keeps only payments that arrived during the run (nothing extra without a run)."""
+    if run is None:
+        return "", ()
+    return (" AND published_at >= %s AND txn_id IN (SELECT txn_id FROM events WHERE "
+            "event_type = 'transaction.received' AND published_at >= %s)",
+            (run["started_at"], run["started_at"]))
+
+
+def minutes(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    return f"{seconds // 60} min {seconds % 60:02d} s"
+
+
+def run_banner(conn, r, run: dict | None, replay_running: bool) -> None:
+    if run is None:
+        st.caption("Counting everything so far. Press ▶ Start replay (or ↺ Reset counters) to "
+                   "start counting a new run from zero.")
+        return
+    sql, args = in_run(run)
+    received, decided, stopped, finished, analyst, last = conn.execute(
+        "SELECT count(*) FILTER (WHERE event_type = 'transaction.received'), "
+        "       count(*) FILTER (WHERE event_type = 'transaction.decided'), "
+        "       count(*) FILTER (WHERE event_type = 'transaction.decided' AND decision IN ('flag', 'hold')), "
+        "       count(DISTINCT txn_id) FILTER (WHERE event_type = 'transaction.resolved'), "
+        "       count(DISTINCT txn_id) FILTER (WHERE event_type = 'transaction.resolved' "
+        "                                      AND decision = 'sent_to_analyst'), "
+        "       max(published_at) "
+        "FROM events WHERE true" + sql, args).fetchone()
+    start = run["started_at"]
+    planned = f" of {run['planned']}" if run["planned"] else ""
+    in_progress = max(0, stopped - finished)
+    if run["planned"] and received < run["planned"] and not replay_running:
+        planned += " (the rest were repeats of earlier runs, which the gateway drops, or the replay was stopped)"
+    lines = [f"**Run started {start:%H:%M:%S} UTC** ({run['label']})",
+             f"Payments: **{received}{planned}** arrived, **{decided}** decided by the fast lane",
+             f"AI checks (slow lane): **{stopped}** flagged or held → **{finished}** finished"
+             + (f" ({analyst} sent to an analyst)" if analyst else "") + f", **{in_progress}** in progress"]
+    done = run.get("completed_at")
+    if done is None:
+        audit_waiting = agent_info(r, "audit", ALL_TYPES)["waiting"]   # the audit log has caught up
+        if (not replay_running and received > 0 and decided == received and in_progress == 0
+                and audit_waiting == 0 and last is not None):
+            r.hsetnx(RUN_KEY, "completed_at", last.isoformat())       # freeze it: later events don't count
+            done = last.isoformat()
+    if done is not None:
+        done = datetime.fromisoformat(done)
+        st.success("  \n".join(lines + [f"✅ **Run complete in {minutes((done - start).total_seconds())}** "
+                                        f"(last event at {done:%H:%M:%S} UTC)"]))
+    else:
+        st.info("  \n".join(lines + [f"⏱ **{minutes((now_utc() - start).total_seconds())}** since the start"]))
 
 
 def status(ok: bool) -> str:
@@ -113,7 +191,14 @@ def control_panel() -> None:
         rate = st.slider("Payments per second", 1, 50, 5)
         holder = replay_holder()
         busy = holder["process"] is not None and holder["process"].poll() is None
+        st.session_state["sidebar_busy"] = busy   # what the sidebar buttons were drawn for
         if st.button("▶ Start replay", disabled=busy, type="primary"):
+            try:
+                start_run(redis_client(), f"replay: {genuine} genuine + {fraud} fraud at {rate}/s",
+                          planned=genuine + fraud)
+            except (redis.ConnectionError, redis.TimeoutError) as error:
+                st.error(f"Can't reach Redis (is Docker running?): {error}")
+                return
             REPLAY_LOG.parent.mkdir(parents=True, exist_ok=True)
             holder["process"] = subprocess.Popen(
                 [sys.executable, "-m", "fraud_agents.services.replayer.replay",
@@ -124,24 +209,46 @@ def control_panel() -> None:
         if busy and st.button("■ Stop replay"):
             holder["process"].terminate()
             st.rerun()
+        if st.button("↺ Reset counters", disabled=busy,
+                     help="Start counting from zero without sending payments. The audit log keeps everything."):
+            try:
+                start_run(redis_client(), "counters reset by hand")
+            except (redis.ConnectionError, redis.TimeoutError) as error:
+                st.error(f"Can't reach Redis (is Docker running?): {error}")
+                return
+            st.rerun()
 
 
 # ---------- Live views (refresh every 2 seconds) ----------
 
 @st.fragment(run_every=2)
 def live() -> None:
+    run = None
     try:
-        board()
+        r = redis_client()
+        run = current_run(r)
+        process = replay_holder()["process"]
+        busy = process is not None and process.poll() is None
+        if busy != st.session_state.get("sidebar_busy", busy):
+            st.rerun()   # the replay started or finished: redraw the whole page, sidebar buttons too
+        banner = st.container()          # drawn above the board, filled after it
+        board(run)
+        with banner:
+            try:
+                run_banner(pg_connection(), r, run, busy)
+            except psycopg.Error as error:
+                pg_connection.clear()
+                st.error(f"Can't reach PostgreSQL (is Docker running?): {error}")
     except (redis.ConnectionError, redis.TimeoutError) as error:
         st.error(f"Can't reach Redis (is Docker running?): {error}")
     try:
-        records()
+        records(run)
     except psycopg.Error as error:
         pg_connection.clear()  # reconnect on the next refresh
         st.error(f"Can't reach PostgreSQL (is Docker running?): {error}")
 
 
-def board() -> None:
+def board(run: dict | None) -> None:
     r = redis_client()
 
     st.subheader("Agent board")
@@ -155,11 +262,13 @@ def board() -> None:
                    delta_color="off")
     cols[2].caption(status(audit["running"]))
     for col, (name, group, streams) in zip(st.columns(len(AGENTS)), AGENTS):
-        info = agent_info(r, group, streams)
+        info = agent_info(r, group, streams, run)
         col.metric(name, f"{info['handled']} read", f"{info['waiting']} waiting", delta_color="off")
         col.caption(status(info["running"]))
-    st.caption("'read' counts every event an agent received, including ones it had nothing to do "
-               "with (e.g. Investigation reads every decision but only works on flags and holds).")
+    st.caption(("Agents' 'read' counts start from zero at the start of the run; " if run else "")
+               + "'read' counts every event an agent received, including ones it had nothing to do "
+               "with (e.g. Investigation reads every decision but only works on flags and holds). "
+               "'waiting' is the live queue. The audit log counts everything, always.")
 
     holder = replay_holder()
     process = holder["process"]
@@ -173,12 +282,13 @@ def board() -> None:
 
 
 
-def records() -> None:
+def records(run: dict | None = None) -> None:
     conn = pg_connection()
+    sql, args = in_run(run)
     decisions = pd.DataFrame(
         conn.execute(
             "SELECT decision, count(*) FROM events "
-            "WHERE event_type = 'transaction.decided' GROUP BY decision"
+            "WHERE event_type = 'transaction.decided'" + sql + " GROUP BY decision", args
         ).fetchall(),
         columns=["decision", "count"],
     )
@@ -193,10 +303,10 @@ def records() -> None:
 
     final = dict(conn.execute(
         "SELECT decision, count(*) FROM (SELECT DISTINCT ON (txn_id) decision FROM events "
-        "  WHERE event_type = 'transaction.resolved' ORDER BY txn_id, published_at DESC) latest "
-        "GROUP BY decision").fetchall())
+        "  WHERE event_type = 'transaction.resolved'" + sql + " ORDER BY txn_id, published_at DESC) latest "
+        "GROUP BY decision", args).fetchall())
 
-    st.subheader("Decisions so far")
+    st.subheader("Decisions in this run" if run else "Decisions so far")
     totals = dict(zip(decisions["decision"], decisions["count"]))
     a, f, h = st.columns(3)
     a.metric("Approved", totals.get("approve", 0))
@@ -228,9 +338,11 @@ REASONS = {  # why a case reached a human, in plain words (rule_id -> text)
     "held_payment_needs_human_release": "The payment was held. The AI investigator found nothing "
                                         "wrong, but only a human (or the customer) may release a held payment.",
     "case_escalated": "An agent could not finish its work, so it handed the case to a human.",
+    "decision_could_not_finish": "The Decision agent could not settle the case after several tries, "
+                                 "so it handed it to a human.",
 }
 REVIEW_LOCK = "analyst:reviewed:{case_id}"   # stops two clicks (or two analysts) deciding one case
-LOCK_SECONDS = 600   # only needs to cover the audit log catching up; the Decision agent is the real guard
+LOCK_SECONDS = 120   # only needs to cover the audit log catching up; the Decision agent is the real guard
 
 
 def plain(text: str) -> str:
@@ -243,22 +355,29 @@ def body(value) -> dict:
 
 
 def open_cases(conn, r) -> list[dict]:
-    """sent_to_analyst outcomes that nobody has reviewed yet, oldest first."""
+    """sent_to_analyst outcomes whose analyst decision has not been APPLIED yet, oldest first.
+
+    A case leaves the queue only when the Decision agent has published the final outcome
+    for its review, not merely when a review was sent (Part 3 · Step 3)."""
     rows = conn.execute(
         "SELECT o.event_id, o.txn_id, o.published_at, o.body->'payload'->>'rule_id', "
-        "       t.body->'payload'->>'amount', t.body->'payload'->>'merchant' "
+        "       t.body->'payload'->>'amount', t.body->'payload'->>'merchant', "
+        "       v.decision, v.body->'payload'->>'analyst', v.published_at "
         "FROM events o "
         "LEFT JOIN events t ON t.txn_id = o.txn_id AND t.event_type = 'transaction.received' "
+        "LEFT JOIN events v ON v.event_type = 'case.reviewed' "
+        "      AND v.body->'payload'->>'based_on_event_id' = o.event_id "
         "WHERE o.event_type = 'transaction.resolved' AND o.decision = 'sent_to_analyst' "
-        "  AND NOT EXISTS (SELECT 1 FROM events v WHERE v.event_type = 'case.reviewed' "
-        "                  AND v.body->'payload'->>'based_on_event_id' = o.event_id) "
+        "  AND NOT EXISTS (SELECT 1 FROM events f WHERE f.event_type = 'transaction.resolved' "
+        "                  AND f.body->'payload'->>'based_on_event_id' = v.event_id) "
         "ORDER BY o.published_at"
     ).fetchall()
     return [
         {"case_id": c, "txn_id": t, "sent_at": at, "rule_id": rule,
-         "amount": amount, "merchant": (merchant or "?").removeprefix("fraud_")}
-        for c, t, at, rule, amount, merchant in rows
-        if not r.exists(REVIEW_LOCK.format(case_id=c))   # just reviewed; audit log catching up
+         "amount": amount, "merchant": (merchant or "?").removeprefix("fraud_"),
+         "pending": None if v_dec is None else {"decision": v_dec, "analyst": v_who, "at": v_at}}
+        for c, t, at, rule, amount, merchant, v_dec, v_who, v_at in rows
+        if not r.exists(REVIEW_LOCK.format(case_id=c))   # just reviewed: give it a moment to apply
     ]
 
 
@@ -385,6 +504,12 @@ def analyst_page() -> None:
                                        f"${float(by_id[c]['amount'] or 0):,.2f} at {by_id[c]['merchant']}"))
             case = by_id[chosen]
             events = case_events(conn, case["txn_id"])
+            if case["pending"]:
+                p = case["pending"]
+                st.warning(f"A **{p['decision'].upper()}** by {p['analyst']} was sent at {p['at']:%H:%M:%S} UTC, "
+                           "but the Decision agent hasn't applied it yet. Is the Decision agent running? "
+                           "(See data/logs/decision.log.) You can send the same decision again; "
+                           "a different one would conflict with the audit log.")
             show_case(case, events)
 
             st.markdown("##### Your decision")
@@ -394,10 +519,12 @@ def analyst_page() -> None:
             occurred = events[0]["body"]["occurred_at"]   # the payment's own time, as on every event
             left, right, _ = st.columns([1, 1, 3])
             choice = None
+            only = case["pending"]["decision"] if case["pending"] else None   # a resend must match
             if left.button("✅ Release", key=f"rel-{chosen}", width="stretch",   # same style as Block:
-                           help="Approve the payment"):                       # no button is "the default"
+                           help="Approve the payment", disabled=only == "block"):  # no default button
                 choice = "release"
-            if right.button("⛔ Block", key=f"blk-{chosen}", width="stretch", help="Stop the payment"):
+            if right.button("⛔ Block", key=f"blk-{chosen}", width="stretch", help="Stop the payment",
+                            disabled=only == "release"):
                 choice = "block"
             if choice:
                 result = submit_review(case, choice, name, note, occurred)
@@ -581,6 +708,16 @@ def caught_page() -> None:
     if df.empty:
         st.info("No payments yet. Start a replay on the Monitor page.")
         return
+    try:
+        run = current_run(redis_client())
+    except (redis.ConnectionError, redis.TimeoutError):
+        run = None                       # Redis down: show everything instead
+    if run and st.toggle(f"This run only (since {run['started_at']:%H:%M:%S} UTC)", value=True,
+                         key="caught_run_only"):
+        df = df[df["arrived"] >= run["started_at"]]
+        if df.empty:
+            st.info("No payments in this run yet.")
+            return
     df["shop"] = df["shop"].str.removeprefix("fraud_")
     df["amount"] = df["amount"].astype(float)
     df["answer key"] = [truth(key, t) for t in df["txn_id"]]
@@ -606,8 +743,7 @@ def caught_page() -> None:
     st.caption("Caught = flagged or held by the first decision; 'blocked in the end' = its final outcome "
                "was blocked. A false alarm is a genuine payment that was flagged or held. Payments "
                "waiting for an analyst are left out (their answer is hidden), and so are payments "
-               "not in the dataset. Counts cover every payment in the audit log; Step 3 measures "
-               "one clean run properly.")
+               "not in the dataset.")
 
     cols = ["txn", "amount", "shop", "shop type", "score", "first decision", "final outcome", "answer key"]
     flagged = df[df["first decision"].isin(["flag", "hold"])]   # all of them, including hidden ones

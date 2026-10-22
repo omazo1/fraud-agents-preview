@@ -13,7 +13,7 @@ Run from the project folder:
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 
 import redis.asyncio as aioredis
@@ -31,6 +31,7 @@ from fraud_agents.shared.events import (
     TransactionReceivedPayload,
     derived_event_id,
     now_utc,
+    to_utc,
 )
 
 log = logging.getLogger("gateway")
@@ -59,8 +60,9 @@ class IncomingPayment(BaseModel):
 
 
 def to_event(p: IncomingPayment, token_key: str) -> TransactionReceived:
-    # Assumption (Step 3): the dataset's times have no time zone; we treat them as UTC.
-    occurred = datetime.fromisoformat(p.trans_date_trans_time).replace(tzinfo=timezone.utc)
+    # A time with a zone is converted to UTC; the dataset's times have none, so they are
+    # treated as UTC (assumption from Step 3). Part 3 · Step 3: no longer overwrites a zone.
+    occurred = to_utc(datetime.fromisoformat(p.trans_date_trans_time))
     return TransactionReceived(
         event_id=derived_event_id(p.trans_num, "gateway"),
         published_at=now_utc(),

@@ -58,7 +58,20 @@ def ensure_group(r: redis.Redis, stream: str, group: str) -> None:
             raise
 
 
-def _dead_letter(r, stream, group, entry_id, fields, reason):
+def _dead_letter(r, stream, group, entry_id, fields, reason, on_give_up=None):
+    # Let the agent react first (e.g. hand the payment to a human). If that fails too, the
+    # event is NOT set aside yet: it stays pending and comes back, and we try again.
+    if on_give_up is not None:
+        try:
+            event = parse_event(fields["event"])
+        except (KeyError, ValidationError):
+            event = None   # not a readable form: nothing to hand over
+        if event is not None:
+            try:
+                on_give_up(event, reason)
+            except Exception:
+                log.exception("on_give_up failed for %s; it will be retried", entry_id)
+                return
     r.xadd(DEAD_LETTER_STREAM, {
         "from_stream": stream, "group": group, "entry_id": entry_id,
         "reason": reason[:500], "event": fields.get("event", ""),
@@ -95,12 +108,15 @@ def consume(
     stop_after: int | None = None,
     batch_size: int = 10,
     reclaim_after_ms: int = RECLAIM_AFTER_MS,
+    on_give_up: Callable | None = None,
 ) -> int:
     """Read events from `stream` forever and pass each one to `handler`.
 
     `stop_after` (for tests) stops after that many events. Returns how many were handled.
     Slow agents (e.g. AI ones) use batch_size=1 and a longer reclaim_after_ms, so an
     event is never picked up again while it is still being worked on.
+    `on_give_up(event, reason)` runs when an event is about to be set aside after failing
+    MAX_DELIVERIES times (Part 3 · Step 3: agents use it to hand the payment to a human).
     """
     consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
     ensure_group(r, stream, group)
@@ -123,7 +139,7 @@ def consume(
             try:
                 handled += _one_round(r, stream, group, handler, consumer, block_ms,
                                       None if stop_after is None else stop_after - handled,
-                                      batch_size, reclaim_after_ms)
+                                      batch_size, reclaim_after_ms, on_give_up)
             except (redis.ConnectionError, redis.TimeoutError) as error:
                 # Redis is restarting or unreachable: wait and try again; nothing is lost,
                 # because unacknowledged events stay in the stream.
@@ -135,7 +151,7 @@ def consume(
 
 
 def _one_round(r, stream, group, handler, consumer, block_ms, limit,
-               batch_size=10, reclaim_after_ms=RECLAIM_AFTER_MS) -> int:
+               batch_size=10, reclaim_after_ms=RECLAIM_AFTER_MS, on_give_up=None) -> int:
     """Read one batch and handle it. Returns how many events were handled."""
     handled = 0
     # A short-lived "I'm alive" note that the System Monitor reads.
@@ -160,7 +176,7 @@ def _one_round(r, stream, group, handler, consumer, block_ms, limit,
         tries = info[0]["times_delivered"] if info else 1
         if tries > MAX_DELIVERIES:
             # It keeps coming back (e.g. it crashed the whole agent): stop retrying it.
-            _dead_letter(r, stream, group, entry_id, fields, f"delivered {tries} times")
+            _dead_letter(r, stream, group, entry_id, fields, f"delivered {tries} times", on_give_up)
             continue
         try:
             _handle(r, stream, group, entry_id, fields, handler)
@@ -168,7 +184,8 @@ def _one_round(r, stream, group, handler, consumer, block_ms, limit,
         except Exception as error:  # left un-acknowledged, so it will be retried
             log.exception("Failed on %s (try %d)", entry_id, tries)
             if tries >= MAX_DELIVERIES:
-                _dead_letter(r, stream, group, entry_id, fields, f"failed {tries} times: {error}")
+                _dead_letter(r, stream, group, entry_id, fields, f"failed {tries} times: {error}",
+                             on_give_up)
         if limit is not None and handled >= limit:
             break
     return handled

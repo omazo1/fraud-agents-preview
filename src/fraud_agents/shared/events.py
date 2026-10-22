@@ -13,6 +13,12 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def to_utc(when: datetime) -> datetime:
+    """A time in UTC. A time WITH a zone is converted; one without is assumed to be UTC
+    (the dataset's times have no zone: assumption from Part 1 · Step 3)."""
+    return when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when.astimezone(timezone.utc)
+
+
 def new_event_id() -> str:
     """A fresh random ID for a new event."""
     return str(uuid4())

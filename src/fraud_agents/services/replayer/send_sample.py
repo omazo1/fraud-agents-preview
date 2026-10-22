@@ -5,17 +5,18 @@ Run from the project folder:  python -m fraud_agents.services.replayer.send_samp
 """
 
 import argparse
-import hashlib
 from decimal import Decimal
 
 import pandas as pd
 
 from fraud_agents.shared import bus
+from fraud_agents.shared.cards import card_token   # the same keyed token as the gateway
 from fraud_agents.shared.events import (
     TransactionReceived,
     TransactionReceivedPayload,
     derived_event_id,
     now_utc,
+    to_utc,
 )
 
 TEST_FILE = "data/raw/fraudTest.csv"
@@ -23,11 +24,6 @@ COLUMNS = [
     "trans_date_trans_time", "cc_num", "merchant", "category", "amt",
     "lat", "long", "city_pop", "trans_num", "merch_lat", "merch_long", "is_fraud",
 ]
-
-
-def card_token(cc_num) -> str:
-    """A stand-in for the card number, so the real number never travels in an event."""
-    return "card-" + hashlib.sha256(f"card:{cc_num}".encode()).hexdigest()[:16]
 
 
 def to_event(row) -> TransactionReceived:
@@ -38,7 +34,7 @@ def to_event(row) -> TransactionReceived:
         published_at=now_utc(),
         txn_id=row.trans_num,
         # Assumption (Step 3): dataset times have no time zone; we treat them as UTC.
-        occurred_at=pd.Timestamp(row.trans_date_trans_time).tz_localize("UTC").to_pydatetime(),
+        occurred_at=to_utc(pd.Timestamp(row.trans_date_trans_time).to_pydatetime()),
         payload=TransactionReceivedPayload(
             card_id=card_token(row.cc_num),
             amount=Decimal(str(row.amt)),

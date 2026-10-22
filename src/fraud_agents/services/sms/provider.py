@@ -14,6 +14,10 @@ It plays two outside parties, so the bank side can be tested end to end:
 
 Every text in and out is kept in the Redis stream "sms:log" for the System Monitor.
 
+Idempotency (Part 3 · Step 3): the bank may send an "Idempotency-Key" header. A second
+request with the same key is not sent again: it gets the first request's message_id.
+So a bank agent that crashed after sending, and retries, never texts the customer twice.
+
 Run from the project folder:
     uvicorn fraud_agents.services.sms.provider:app --port 8100
 """
@@ -146,12 +150,25 @@ async def _customer_answers(state, msg: OutgoingText, message_id: str) -> None:
 
 
 @app.post("/messages", status_code=202)
-async def send_text(msg: OutgoingText, x_api_key: str | None = Header(default=None)):
+async def send_text(msg: OutgoingText, x_api_key: str | None = Header(default=None),
+                    idempotency_key: str | None = Header(default=None, max_length=200)):
     """The bank sends a text to a customer."""
     if x_api_key != app.state.api_key:
         raise HTTPException(status_code=401, detail="bad API key")
     message_id = "sms-out-" + uuid.uuid4().hex[:12]
-    await record(app.state.redis, "out", msg.to, msg.text, message_id, msg.txn_id)
+    if idempotency_key:
+        first = await app.state.redis.set(f"sms:idem:{idempotency_key}", message_id, nx=True,
+                                          ex=7 * 24 * 3600)
+        if not first:   # already sent for this key: don't text the customer again
+            earlier = await app.state.redis.get(f"sms:idem:{idempotency_key}")
+            log.info("Repeat of %s (same Idempotency-Key): not sent again", earlier)
+            return {"status": "duplicate", "message_id": earlier}
+    try:
+        await record(app.state.redis, "out", msg.to, msg.text, message_id, msg.txn_id)
+    except Exception:
+        if idempotency_key:   # nothing was sent: free the key so the bank's retry goes through
+            await app.state.redis.delete(f"sms:idem:{idempotency_key}")
+        raise
     log.info("Text %s to %s: %s", message_id, msg.to, msg.text[:80])
     if msg.expects_reply:
         task = asyncio.create_task(customer_answers(app.state, msg, message_id))

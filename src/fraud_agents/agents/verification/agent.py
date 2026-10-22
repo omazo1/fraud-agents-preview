@@ -16,8 +16,10 @@ wait for the reply for as long as needed, even if the agent is stopped and resta
   provider, and publishes verification.requested (its event_id is the reference the
   reply comes back with).
 - wait_for_reply: interrupt() pauses the graph; the state is saved in PostgreSQL.
-- read_reply: plain keyword rules read clear answers (YES / NO); only replies the rules
-  can't read go to the AI (Llama), which labels them confirmed / denied / unclear.
+- read_reply: plain rules decide only CLEAN answers (the whole reply is a yes or a no,
+  e.g. "YES that was me", "no!! not me"); a question back is unclear. Everything else
+  goes to the AI (Llama). The AI may say denied or unclear; if it says confirmed, that is
+  treated as unclear, so the AI never releases a payment (Part 3 · Step 3).
   (Mac runs: Llama labelled clear "NO" replies as unclear, so rules now go first; it also
   labelled "who is this?" as denied, so a question back is now "unclear" by rule, and the
   AI's prompt has examples and "when in doubt, choose unclear".)
@@ -52,6 +54,8 @@ from typing_extensions import TypedDict
 
 from fraud_agents.shared import bus, config, db
 from fraud_agents.shared.events import (
+    CaseEscalated,
+    CaseEscalatedPayload,
     CustomerReplied,
     InvestigationCompleted,
     VerificationCompleted,
@@ -65,6 +69,8 @@ from fraud_agents.shared.llm import LLMCallLogger, chat_model, run_config
 
 PRODUCER = "verification"
 WAITING = "verification:waiting"         # Redis hash: reference -> the paused case
+TIMEOUT_FAILURES = "verification:timeout_failures"   # reference -> failed timeout tries
+MAX_TIMEOUT_FAILURES = 12                # checks run every 5 s: about a minute of errors
 REPLY_TIMEOUT_SECONDS = int(os.environ.get("VERIFICATION_TIMEOUT_SECONDS", "60"))
 NO_REPLY = "__no_reply__"
 SMS_URL = os.environ.get("SMS_PROVIDER_URL", "http://localhost:8100") + "/messages"
@@ -93,16 +99,44 @@ class State(TypedDict):
     outcome: str | None
 
 
+# Clean answers the rules may decide on their own. The WHOLE reply must be one of these
+# (after lower-casing and dropping punctuation): an optional yes/no word, then an optional
+# phrase that says the same thing. Anything else, e.g. a reply mixing yes and no words
+# ("No problem, yes that was me") or saying something else ("Yesterday I made a
+# different payment"), is not decided by the rules.
+_THIS = r"(?: (?:it|that|this|the|this payment|that payment|the payment))?"
+_YES_WORD = r"(?:yes|y|yeah|yep|yup)"
+_YES_PHRASE = (r"(?:it was me|that was me|thats me|that is me|i did|its mine|it is mine|mine"
+               rf"|i made{_THIS}|i paid{_THIS}|i made this payment|i made that payment)")
+_NO_WORD = r"(?:no|n|nope|nah)"
+_NO_PHRASE = (r"(?:not me|it was not me|it wasnt me|that was not me|that wasnt me|wasnt me|not mine"
+              rf"|i did not|i didnt|i did not make{_THIS}|i didnt make{_THIS}"
+              r"|i did not make this payment|i didnt make this payment|i never made it)")
+# Words that say "yes" even inside a longer reply ("mine" and "I did" are left out on
+# purpose: they also appear in denials like "that wasn't mine" or "I did not buy that").
+YES_SIGNAL = re.compile(r"\b(yes|yeah|yep|yup|it was me|that was me)\b", re.IGNORECASE)
+CLEAN_YES = re.compile(rf"^(?:{_YES_WORD}(?: {_YES_PHRASE})?|{_YES_PHRASE})$")
+CLEAN_NO = re.compile(rf"^(?:{_NO_WORD}(?: {_NO_PHRASE})?|{_NO_PHRASE})$")
+
+
 def keyword_label(text: str) -> str:
-    """Plain rules, read before the AI. A question back to the bank is never an answer."""
-    t = text.strip().lower()
+    """Plain rules, read before the AI: they decide ONLY a clean yes or a clean no.
+
+    "confirmed" / "denied" for a clean answer; "question" for a question back to the bank
+    (never an answer); "unknown" for everything else (the AI reads it, and if the AI is
+    unsure or says "confirmed", a human decides)."""
+    t = text.strip().lower().replace("’", "'")
     if t.endswith("?"):
-        return "unclear"
-    if re.search(r"\b(no|n|not me|wasn'?t me|did not|didn'?t)\b", t):
-        return "denied"
-    if re.search(r"\b(yes|y|it was me|i made)\b", t):
+        return "question"
+    if re.search(r"[^a-z0-9 .,!'\-]", t):
+        return "unknown"      # emoji, other scripts or symbols ("Yes ❌", "Yes नहीं"): not a clean answer
+    t = re.sub(r"[^a-z ]+", " ", t.replace("'", ""))   # "wasn't" -> "wasnt"; drop punctuation
+    t = " ".join(w for i, w in enumerate(t.split()) if i == 0 or w != t.split()[i - 1])  # "no no" -> "no"
+    if CLEAN_YES.match(t):
         return "confirmed"
-    return "unclear"
+    if CLEAN_NO.match(t):
+        return "denied"
+    return "unknown"
 
 
 class Verifier:
@@ -129,7 +163,9 @@ class Verifier:
                 f"dbname={config.require('POSTGRES_DB')}")
 
     def _sms_post(self, payload: dict) -> None:
-        response = httpx.post(SMS_URL, json=payload, headers={"X-Api-Key": self.sms_key}, timeout=10)
+        # The reference is unique per question, so a retry after a crash is not sent twice.
+        response = httpx.post(SMS_URL, json=payload, timeout=10, headers={
+            "X-Api-Key": self.sms_key, "Idempotency-Key": f"verification:{payload['reference']}"})
         response.raise_for_status()
 
     def _text(self, state: State, text: str, reference: str) -> None:
@@ -137,7 +173,8 @@ class Verifier:
         self.sms_post({"to": state["card_id"], "text": text, "reference": reference,
                        "txn_id": state["txn_id"], "expects_reply": True})
         self.r.hset(WAITING, reference, json.dumps({"thread": thread_id(state["based_on"]),
-                                                    "since": time.time()}))
+                                                    "since": time.time(), "txn_id": state["txn_id"],
+                                                    "occurred_at": state["occurred_at"]}))
         event = VerificationRequested(
             event_id=reference, published_at=now_utc(), txn_id=state["txn_id"],
             occurred_at=state["occurred_at"],
@@ -160,11 +197,13 @@ class Verifier:
         def read_reply(state: State, config: RunnableConfig) -> dict:
             if state["reply"] == NO_REPLY:
                 return {"label": "no_reply"}
-            # 1. Plain rules first: a clear YES or NO, or a question back to the bank,
+            # 1. Plain rules first: a clean YES or NO, or a question back to the bank,
             #    needs no AI (and the AI can't overrule it).
             label = keyword_label(state["reply"])
-            if label != "unclear" or state["reply"].strip().endswith("?"):
+            if label in ("confirmed", "denied"):
                 return {"label": label, "labelled_by": "rules"}
+            if label == "question":
+                return {"label": "unclear", "labelled_by": "rules"}
             # 2. Only replies the rules can't read go to the AI.
             prompt = (f"A bank texted a customer: \"{state['question']}\"\n"
                       f"The customer replied: \"{state['reply']}\"\n"
@@ -177,9 +216,18 @@ class Verifier:
                       "'hmm not sure' -> unclear; 'what is this about' -> unclear.")
             try:
                 label = self.labeller.invoke([HumanMessage(prompt)], config=config).label
-            except Exception as error:   # the AI failed: keep the rules' answer
+            except Exception as error:   # the AI failed: unclear (asked again, then a human)
                 log.warning("AI could not label %r (%s); keeping 'unclear'", state["reply"], error)
                 return {"label": "unclear", "labelled_by": "rules"}
+            if label == "denied" and YES_SIGNAL.search(state["reply"]):
+                # Mixed signals ("No problem, yes that was me"): a human decides, not the AI.
+                log.info("AI read %r as denied, but it also says yes: treated as unclear", state["reply"])
+                return {"label": "unclear", "labelled_by": "AI (mixed signals, needs a human)"}
+            if label == "confirmed":
+                # The AI never releases a payment on its own: a "yes" only the AI could read
+                # is treated as unclear, so the customer is asked again, then a human decides.
+                log.info("AI read %r as confirmed: treated as unclear (a human decides)", state["reply"])
+                return {"label": "unclear", "labelled_by": "AI (confirmed, needs a human)"}
             return {"label": label, "labelled_by": "AI"}
 
         def after_read(state: State) -> Literal["ask_again", "finish"]:
@@ -238,7 +286,12 @@ class Verifier:
         }, cfg)
         log.info("txn %s  texted the customer, now WAITING (paused)", report.txn_id[:8])
 
-    def resume(self, reference: str, reply: str) -> None:
+    def resume(self, reference: str, reply: str, card_id: str | None = None,
+               txn_id: str | None = None) -> None:
+        """Continue the paused case for `reference` with the customer's reply (or NO_REPLY).
+
+        A real reply must come from the same card, about the same payment, as the waiting
+        case; if not, it is ignored and the case keeps waiting (then times out to a human)."""
         info = self.r.hget(WAITING, reference)
         if info is None:
             log.info("No case waiting for reference %s (late or repeated reply): ignored", reference[:8])
@@ -251,6 +304,13 @@ class Verifier:
         try:
             thread = json.loads(info)["thread"]
             snapshot = self.graph.get_state({"configurable": {"thread_id": thread}})
+            if reply != NO_REPLY:
+                expected = (snapshot.values.get("card_id"), snapshot.values.get("txn_id"))
+                if (card_id, txn_id) != expected:
+                    log.warning("Reply for reference %s ignored: it came from card %s about txn %s, "
+                                "but the case is card %s, txn %s", reference[:8], card_id,
+                                (txn_id or "?")[:8], expected[0], (expected[1] or "?")[:8])
+                    return
             cfg = self._config(thread, snapshot.values["txn_id"])
             if snapshot.interrupts:                       # paused, waiting: the normal case
                 result = self.graph.invoke(Command(resume=reply), cfg)
@@ -272,6 +332,23 @@ class Verifier:
             self.r.hdel(WAITING, reference)
         finally:
             self.r.delete(lock)
+
+    def _give_up_waiting(self, reference: str, info: str) -> None:
+        try:
+            values = json.loads(info)       # the case's payment, saved when the text was sent
+            if "txn_id" not in values:      # an entry from before this change: read the saved graph
+                values = self.graph.get_state({"configurable": {"thread_id": values["thread"]}}).values
+            bus.publish(self.r, CaseEscalated(
+                event_id=derived_event_id(reference, PRODUCER, "case.escalated"), published_at=now_utc(),
+                txn_id=values["txn_id"], occurred_at=values["occurred_at"], producer=PRODUCER,
+                payload=CaseEscalatedPayload(reason="The customer check could not be finished after "
+                                             "repeated errors, so a human must decide.",
+                                             based_on_event_id=reference)))
+            self.r.hdel(WAITING, reference)
+            self.r.hdel(TIMEOUT_FAILURES, reference)
+            log.warning("txn %s  customer check gave up: ESCALATED to a human", values["txn_id"][:8])
+        except Exception:
+            log.exception("Could not escalate %s either; will try again", reference[:8])
 
     def _publish_result(self, state: dict) -> None:
         event = VerificationCompleted(
@@ -298,6 +375,25 @@ class Verifier:
                     self.resume(reference, NO_REPLY)
             except Exception:
                 log.exception("Timeout handling failed for %s; will try again", reference[:8])
+                # After many failed tries (about a minute), stop and hand the case to a human.
+                if self.r.hincrby(TIMEOUT_FAILURES, reference, 1) >= MAX_TIMEOUT_FAILURES:
+                    self._give_up_waiting(reference, info)
+
+
+def give_up(r, event, reason: str) -> None:
+    """Starting or resuming a customer check failed every try: hand the payment to a human."""
+    if isinstance(event, InvestigationCompleted):
+        if event.payload.recommended_action != "verify_with_customer":
+            return
+    elif not isinstance(event, CustomerReplied):
+        return
+    bus.publish(r, CaseEscalated(
+        event_id=derived_event_id(event.event_id, PRODUCER, "case.escalated"),
+        published_at=now_utc(), txn_id=event.txn_id, occurred_at=event.occurred_at, producer=PRODUCER,
+        payload=CaseEscalatedPayload(
+            reason=f"The customer check could not finish ({reason[:300]}), so a human must decide.",
+            based_on_event_id=event.event_id)))
+    log.warning("txn %s  customer check gave up: ESCALATED to a human", event.txn_id[:8])
 
 
 def thread_id(investigation_event_id: str) -> str:
@@ -330,13 +426,15 @@ def main() -> None:
 
     def on_reply(event):
         if isinstance(event, CustomerReplied):
-            verifier.resume(event.payload.in_reply_to, event.payload.reply_text)
+            verifier.resume(event.payload.in_reply_to, event.payload.reply_text,
+                            card_id=event.payload.card_id, txn_id=event.txn_id)
 
     host = f"{socket.gethostname()}-{os.getpid()}"
     for stream, handler in [("investigation.completed", on_report), ("customer.replied", on_reply)]:
         threading.Thread(target=bus.consume, daemon=True, name=stream, args=(
             bus.connect(), bus.stream_for(stream), PRODUCER, handler),
-            kwargs={"consumer": f"{host}-{stream}", "batch_size": 1}).start()
+            kwargs={"consumer": f"{host}-{stream}", "batch_size": 1,
+                    "on_give_up": lambda event, reason: give_up(r, event, reason)}).start()
     log.info("Verifying with %s; a customer who doesn't reply within %d s counts as 'no reply'. "
              "Press Ctrl + C to stop.", getattr(verifier.model, "model", "the model"), REPLY_TIMEOUT_SECONDS)
     try:
