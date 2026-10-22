@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the whole fraud system with one command (added in Part 2 · Step 6).
+# Start the whole fraud system with one command (added in Part 2 · Step 6; Notification added in Step 7).
 #   bash scripts/start_all.sh     start everything (skips anything already running)
 #   bash scripts/status.sh        what is running, and each program's last log line
 #   bash scripts/stop_all.sh      stop everything (Docker keeps running)
@@ -18,6 +18,7 @@ risk-scoring|$PY -m fraud_agents.agents.risk_scoring.agent
 decision|$PY -m fraud_agents.agents.decision.agent
 investigation|$PY -m fraud_agents.agents.investigation.agent
 verification|$PY -m fraud_agents.agents.verification.agent
+notification|$PY -m fraud_agents.agents.notification.agent
 monitor|$PY -m streamlit run src/fraud_agents/monitor/app.py
 "
 
