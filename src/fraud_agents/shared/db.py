@@ -21,6 +21,21 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_txn_idx ON events (txn_id);
 CREATE INDEX IF NOT EXISTS events_published_idx ON events (published_at DESC);
+
+CREATE TABLE IF NOT EXISTS llm_calls (      -- one row per call to a language model
+    id             BIGSERIAL PRIMARY KEY,
+    called_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    agent          TEXT,                     -- which agent asked
+    txn_id         TEXT,                     -- which payment it was about
+    provider       TEXT,                     -- ollama or anthropic
+    model          TEXT,
+    latency_ms     INTEGER,
+    input_tokens   INTEGER,
+    output_tokens  INTEGER,
+    ok             BOOLEAN NOT NULL,
+    error          TEXT
+);
+CREATE INDEX IF NOT EXISTS llm_calls_txn_idx ON llm_calls (txn_id);
 """
 
 
