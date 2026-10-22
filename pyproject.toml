@@ -22,6 +22,7 @@ dependencies = [
     "langchain>=1.4,<2",
     "langchain-ollama>=1.1,<2",
     "langchain-anthropic>=1.7,<2",
+    "langgraph>=1.2,<2",
 ]
 
 [tool.setuptools.packages.find]

@@ -92,10 +92,14 @@ def consume(
     consumer: str | None = None,
     block_ms: int = 5000,
     stop_after: int | None = None,
+    batch_size: int = 10,
+    reclaim_after_ms: int = RECLAIM_AFTER_MS,
 ) -> int:
     """Read events from `stream` forever and pass each one to `handler`.
 
     `stop_after` (for tests) stops after that many events. Returns how many were handled.
+    Slow agents (e.g. AI ones) use batch_size=1 and a longer reclaim_after_ms, so an
+    event is never picked up again while it is still being worked on.
     """
     consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
     ensure_group(r, stream, group)
@@ -103,7 +107,8 @@ def consume(
     while stop_after is None or handled < stop_after:
         try:
             handled += _one_round(r, stream, group, handler, consumer, block_ms,
-                                  None if stop_after is None else stop_after - handled)
+                                  None if stop_after is None else stop_after - handled,
+                                  batch_size, reclaim_after_ms)
         except (redis.ConnectionError, redis.TimeoutError) as error:
             # Redis is restarting or unreachable: wait and try again; nothing is lost,
             # because unacknowledged events stay in the stream.
@@ -112,18 +117,20 @@ def consume(
     return handled
 
 
-def _one_round(r, stream, group, handler, consumer, block_ms, limit) -> int:
+def _one_round(r, stream, group, handler, consumer, block_ms, limit,
+               batch_size=10, reclaim_after_ms=RECLAIM_AFTER_MS) -> int:
     """Read one batch and handle it. Returns how many events were handled."""
     handled = 0
     # A short-lived "I'm alive" note that the System Monitor reads.
     r.set(alive_key(group, stream), consumer, ex=ALIVE_TTL_SECONDS)
     try:
         # 1. Pick up events another copy left unfinished (e.g. it crashed).
-        _, claimed, _ = r.xautoclaim(stream, group, consumer, RECLAIM_AFTER_MS, "0-0", count=10)
+        _, claimed, _ = r.xautoclaim(stream, group, consumer, reclaim_after_ms, "0-0",
+                                     count=batch_size)
         # 2. Then read new events, waiting up to block_ms for one to arrive.
         batch = claimed
         if not batch:
-            reply = r.xreadgroup(group, consumer, {stream: ">"}, count=10, block=block_ms)
+            reply = r.xreadgroup(group, consumer, {stream: ">"}, count=batch_size, block=block_ms)
             batch = reply[0][1] if reply else []
     except redis.ResponseError as error:
         if "NOGROUP" not in str(error) and "UNBLOCKED" not in str(error):
