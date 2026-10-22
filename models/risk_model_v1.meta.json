@@ -1,0 +1,65 @@
+{
+  "model_version": "risk_model_v1",
+  "trained_at": "2026-10-22T14:22:00+00:00",
+  "features": [
+    "amount",
+    "category",
+    "hour",
+    "day_of_week",
+    "distance_km",
+    "city_pop"
+  ],
+  "categories": [
+    "entertainment",
+    "food_dining",
+    "gas_transport",
+    "grocery_net",
+    "grocery_pos",
+    "health_fitness",
+    "home",
+    "kids_pets",
+    "misc_net",
+    "misc_pos",
+    "personal_care",
+    "shopping_net",
+    "shopping_pos",
+    "travel"
+  ],
+  "trees": 235,
+  "trained_on": "data/raw/fraudTrain.csv (first 90% by time; last 10% used for early stopping)",
+  "tested_on": "data/raw/fraudTest.csv",
+  "test": {
+    "rows": 555719,
+    "fraud_rows": 2145,
+    "roc_auc": 0.9964,
+    "pr_auc": 0.7915,
+    "at_threshold": {
+      "0.1": {
+        "caught": 1793,
+        "missed": 352,
+        "false_alarms": 2051
+      },
+      "0.3": {
+        "caught": 1585,
+        "missed": 560,
+        "false_alarms": 670
+      },
+      "0.5": {
+        "caught": 1427,
+        "missed": 718,
+        "false_alarms": 397
+      },
+      "0.7": {
+        "caught": 1228,
+        "missed": 917,
+        "false_alarms": 157
+      },
+      "0.9": {
+        "caught": 875,
+        "missed": 1270,
+        "false_alarms": 35
+      }
+    }
+  },
+  "xgboost_version": "3.4.1"
+}

@@ -7,7 +7,13 @@ name = "fraud-agents"
 version = "0.1.0"
 description = "Event-driven multi-agent AI fraud detection system (capstone project)"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.14,<3"]
+dependencies = [
+    "pydantic>=2.14,<3",
+    "pandas>=3.1,<4",
+    "scikit-learn>=1.9,<2",
+    "xgboost>=3.4,<4",
+    "shap>=0.54,<1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
