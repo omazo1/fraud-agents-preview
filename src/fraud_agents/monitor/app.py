@@ -1,8 +1,12 @@
-"""The Fraud System Monitor (Part 1 · Step 8; Analyst page added in Part 3 · Step 1).
+"""The Fraud System Monitor (Part 1 · Step 8; Analyst page in Part 3 · Step 1; the rest in Step 2).
 
-Two pages, picked in the sidebar:
-- Monitor: which services and agents are running and how busy they are, the latest
-  events, the decision totals, and a control panel to start a replay. Read-only.
+Pages, picked in the sidebar:
+- Monitor: every service and agent (running or stopped, how busy), decision and
+  final-outcome totals, the latest events, and a control panel to start a replay. Read-only.
+- Payment trace: one payment's whole journey, event by event, with the AI calls it used.
+- Caught payments: what was flagged or held, checked against the dataset's answer key
+  (shown here for testing only: the agents never see it).
+- SMS inbox: every text the bank sent and every customer reply, per customer.
 - Analyst: the cases the system sent to a human. The analyst reads the evidence and
   clicks Release or Block. That publishes ONE event (case.reviewed); the Decision agent
   turns it into the final outcome and the Notification agent texts the customer.
@@ -29,11 +33,18 @@ from fraud_agents.shared.events import EVENT_TYPES as ALL_TYPES
 from fraud_agents.shared.events import CaseReviewed, CaseReviewedPayload, derived_event_id, now_utc
 
 GATEWAY_HEALTH = "http://localhost:8000/health"
+SMS_HEALTH = "http://localhost:8100/health"
 REPLAY_LOG = Path("data/processed/replay_from_monitor.log")
+ANSWER_KEY_FILE = Path("data/raw/fraudTest.csv")
+SMS_LOG = "sms:log"   # the mock SMS provider's record of every text in and out
 
-AGENTS = [  # (name on the board, consumer group, the stream it reads)
-    ("Risk Scoring agent", "risk-scoring", "transaction.received"),
-    ("Decision agent", "decision", "risk.scored"),
+AGENTS = [  # (name on the board, consumer group, the streams it reads)
+    ("Risk Scoring", "risk-scoring", ["transaction.received"]),
+    ("Decision", "decision", ["risk.scored", "verification.completed", "investigation.completed",
+                              "case.escalated", "case.reviewed"]),
+    ("Investigation (AI)", "investigation", ["transaction.decided"]),
+    ("Verification (AI)", "verification", ["investigation.completed", "customer.replied"]),
+    ("Notification (AI)", "notification", ["transaction.resolved"]),
 ]
 
 st.set_page_config(page_title="Fraud System Monitor", layout="wide")
@@ -73,11 +84,18 @@ def group_info(r, event_type: str, group: str) -> dict:
     }
 
 
-def gateway_up() -> bool:
+def service_up(url: str) -> bool:
     try:
-        return httpx.get(GATEWAY_HEALTH, timeout=0.5).status_code == 200
+        return httpx.get(url, timeout=0.5).status_code == 200
     except httpx.HTTPError:
         return False
+
+
+def agent_info(r, group: str, streams: list[str]) -> dict:
+    """An agent's totals over every stream it reads; running only if it reads all of them."""
+    parts = [group_info(r, t, group) for t in streams]
+    return {"handled": sum(x["handled"] for x in parts), "waiting": sum(x["waiting"] for x in parts),
+            "running": all(x["running"] for x in parts)}
 
 
 def status(ok: bool) -> str:
@@ -127,21 +145,21 @@ def board() -> None:
     r = redis_client()
 
     st.subheader("Agent board")
-    cols = st.columns(4)
-    with cols[0]:
-        st.metric("Gateway", "up" if gateway_up() else "down")
-        st.caption(status(gateway_up()))
-    for col, (name, group, stream) in zip(cols[1:3], AGENTS):
-        info = group_info(r, stream, group)
-        with col:
-            st.metric(name, f"{info['handled']} handled", f"{info['waiting']} waiting",
-                      delta_color="off")
-            st.caption(status(info["running"]))
-    audit = [group_info(r, t, "audit") for t in ALL_TYPES]
-    with cols[3]:
-        st.metric("Audit log", f"{sum(a['handled'] for a in audit)} recorded",
-                  f"{sum(a['waiting'] for a in audit)} waiting", delta_color="off")
-        st.caption(status(all(a["running"] for a in audit)))
+    cols = st.columns(3)
+    for col, (name, url) in zip(cols, [("Gateway", GATEWAY_HEALTH), ("SMS provider", SMS_HEALTH)]):
+        up = service_up(url)
+        col.metric(name, "up" if up else "down")
+        col.caption(status(up))
+    audit = agent_info(r, "audit", ALL_TYPES)
+    cols[2].metric("Audit log", f"{audit['handled']} recorded", f"{audit['waiting']} waiting",
+                   delta_color="off")
+    cols[2].caption(status(audit["running"]))
+    for col, (name, group, streams) in zip(st.columns(len(AGENTS)), AGENTS):
+        info = agent_info(r, group, streams)
+        col.metric(name, f"{info['handled']} read", f"{info['waiting']} waiting", delta_color="off")
+        col.caption(status(info["running"]))
+    st.caption("'read' counts every event an agent received, including ones it had nothing to do "
+               "with (e.g. Investigation reads every decision but only works on flags and holds).")
 
     holder = replay_holder()
     process = holder["process"]
@@ -173,12 +191,23 @@ def records() -> None:
         columns=["sent (UTC)", "event", "txn", "from", "score", "decision"],
     )
 
+    final = dict(conn.execute(
+        "SELECT decision, count(*) FROM (SELECT DISTINCT ON (txn_id) decision FROM events "
+        "  WHERE event_type = 'transaction.resolved' ORDER BY txn_id, published_at DESC) latest "
+        "GROUP BY decision").fetchall())
+
     st.subheader("Decisions so far")
     totals = dict(zip(decisions["decision"], decisions["count"]))
     a, f, h = st.columns(3)
     a.metric("Approved", totals.get("approve", 0))
     f.metric("Flagged", totals.get("flag", 0))
     h.metric("Held", totals.get("hold", 0))
+    st.caption("Final outcomes of the flagged and held payments (after the AI agents, the customer "
+               "and the analyst):")
+    rel, blk, ana = st.columns(3)
+    rel.metric("Released", final.get("released", 0))
+    blk.metric("Blocked", final.get("blocked", 0))
+    ana.metric("Waiting for an analyst", final.get("sent_to_analyst", 0))
 
     st.subheader("Live event feed (latest 30)")
     st.dataframe(feed, hide_index=True, width="stretch")
@@ -390,7 +419,247 @@ def analyst_page() -> None:
         st.error(f"Can't reach PostgreSQL (is Docker running?): {error}")
 
 
+# ---------- Shared helpers for the Step 2 pages ----------
+
+@st.cache_resource(show_spinner="Loading the answer key…")
+def _load_answer_key() -> dict[str, int]:
+    df = pd.read_csv(ANSWER_KEY_FILE, usecols=["trans_num", "is_fraud"])
+    return dict(zip(df["trans_num"], df["is_fraud"]))
+
+
+def answer_key() -> dict[str, int] | None:
+    """trans_num -> is_fraud from the dataset. For testing only: the agents never see it."""
+    return _load_answer_key() if ANSWER_KEY_FILE.exists() else None
+
+
+def truth(key: dict | None, txn_id: str) -> str:
+    if key is None or txn_id not in key:
+        return "unknown"
+    return "FRAUD" if key[txn_id] else "genuine"
+
+
+def what_happened(e: dict) -> str:
+    """One line, in plain words, for one event."""
+    p = e["body"]["payload"]
+    t = e["type"]
+    if t == "transaction.received":
+        return f"Payment arrived: ${float(p['amount']):,.2f} at {p['merchant'].removeprefix('fraud_')} ({p['category']})"
+    if t == "risk.scored":
+        return f"Scored {p['score']:.2f} by model {p['model_version']}" + (
+            f" (pushed up by: {', '.join(map(str, p['top_factors']))})" if p.get("top_factors") else "")
+    if t == "transaction.decided":
+        return f"First decision: {p['decision'].upper()} ({p['rule_id']})"
+    if t == "investigation.completed":
+        return (f"AI report: {p['verdict'].replace('_', ' ')}; suggests "
+                f"{p['recommended_action'].replace('_', ' ')} (tools: {', '.join(p['tools_used']) or 'none'})")
+    if t == "verification.requested":
+        return f"Texted the customer: {p['message']}"
+    if t == "customer.replied":
+        return f"Customer replied: {p['reply_text']}"
+    if t == "verification.completed":
+        return f"Customer check finished: {p['outcome'].replace('_', ' ')}"
+    if t == "transaction.resolved":
+        return f"FINAL OUTCOME: {p['resolution'].replace('_', ' ').upper()} ({p['rule_id']})"
+    if t == "notification.sent":
+        return f"Told the customer ({'template' if p['used_template'] else 'AI draft'}): {p['message']}"
+    if t == "case.escalated":
+        return f"Handed to a human: {p['reason']}"
+    if t == "case.reviewed":
+        return f"Analyst {p['analyst']} clicked {p['decision'].upper()}" + (f": {p['note']}" if p.get("note") else "")
+    return t
+
+
+# ---------- Payment trace page (Part 3 · Step 2) ----------
+
+def trace_page() -> None:
+    st.title("Payment trace")
+    st.caption("One payment's whole journey through the system, event by event.")
+    try:
+        conn = pg_connection()
+        recent = conn.execute(
+            "SELECT d.txn_id, d.decision, d.published_at, t.body->'payload'->>'amount', "
+            "       t.body->'payload'->>'merchant' "
+            "FROM events d JOIN events t ON t.txn_id = d.txn_id AND t.event_type = 'transaction.received' "
+            "WHERE d.event_type = 'transaction.decided' AND d.decision IN ('flag', 'hold') "
+            "ORDER BY d.published_at DESC LIMIT 200").fetchall()
+        typed = st.text_input("Payment ID (the first 8 characters are enough)", key="trace_id").strip()
+        if typed:
+            prefix = typed.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+            found = conn.execute("SELECT DISTINCT txn_id FROM events WHERE txn_id LIKE %s LIMIT 5",
+                                 (prefix + "%",)).fetchall()
+            if not found:
+                st.warning("No payment with that ID in the audit log.")
+                return
+            if len(found) > 1:
+                st.warning("More than one payment starts with that; type more characters.")
+                return
+            txn_id = found[0][0]
+        elif recent:
+            labels = {t: f"{at:%H:%M:%S} · txn {t[:8]} · {d.upper()} · ${float(a):,.2f} at "
+                         f"{m.removeprefix('fraud_')}" for t, d, at, a, m in recent}
+            txn_id = st.selectbox("…or pick a recent flagged or held payment", list(labels),
+                                  format_func=labels.get, key="trace_pick")
+        else:
+            st.info("No flagged or held payments yet. Start a replay on the Monitor page.")
+            return
+        show_trace(conn, txn_id)
+    except psycopg.Error as error:
+        pg_connection.clear()
+        st.error(f"Can't reach PostgreSQL (is Docker running?): {error}")
+
+
+def show_trace(conn, txn_id: str) -> None:
+    events = case_events(conn, txn_id)
+    first = {}
+    for e in events:
+        first.setdefault(e["type"], e)
+    resolved = [e for e in events if e["type"] == "transaction.resolved"]
+    paid = first.get("transaction.received", {}).get("body", {}).get("payload", {})
+    a, b, c, d = st.columns(4)
+    a.metric("Amount", f"${float(paid['amount']):,.2f}" if paid else "?")
+    b.metric("First decision", (first.get("transaction.decided", {}).get("result") or "—").upper())
+    c.metric("Final outcome", resolved[-1]["result"].replace("_", " ") if resolved else "—")
+    c.caption("The latest one counts (an analyst can replace 'sent to analyst').")
+    waiting = bool(resolved) and resolved[-1]["result"] == "sent_to_analyst"
+    d.metric("Answer key", "hidden" if waiting else truth(answer_key(), txn_id))
+    d.caption("Hidden until the analyst decides, so it can't sway them." if waiting
+              else "For testing only: the agents never see it.")
+    st.caption(f"txn {txn_id} · shop {paid.get('merchant', '?').removeprefix('fraud_')} · "
+               f"card {paid.get('card_id', '?')}")
+
+    start = events[0]["at"]
+    st.markdown("##### The journey (time since the payment arrived · agent · what happened)")
+    for e in events:
+        st.markdown(f"`+{(e['at'] - start).total_seconds():.1f} s` **{e['from']}** · {plain(what_happened(e))}")
+
+    report = first.get("investigation.completed", {}).get("body", {}).get("payload")
+    if report:
+        with st.expander("The AI investigator's full report"):
+            st.markdown(plain(report["summary"]))
+            for item in report.get("evidence", []):
+                st.markdown(f"- {plain(item)}")
+    calls = conn.execute(
+        "SELECT to_char(called_at AT TIME ZONE 'UTC', 'HH24:MI:SS'), agent, model, latency_ms, "
+        "input_tokens, output_tokens, ok, coalesce(error, '') FROM llm_calls WHERE txn_id = %s "
+        "ORDER BY called_at", (txn_id,)).fetchall()
+    st.markdown(f"##### AI calls for this payment: {len(calls)}")
+    if calls:
+        st.dataframe(pd.DataFrame(calls, columns=["at (UTC)", "agent", "model", "ms", "tokens in",
+                                                  "tokens out", "ok", "error"]),
+                     hide_index=True, width="stretch")
+    with st.expander("Raw events (exactly as stored in the audit log)"):
+        for e in events:
+            st.markdown(f"**{e['type']}** from {e['from']}")
+            st.json(e["body"], expanded=False)
+
+
+# ---------- Caught payments page (Part 3 · Step 2) ----------
+
+def caught_page() -> None:
+    st.title("Caught payments")
+    st.caption("Every payment in the audit log, checked against the dataset's answer key (is_fraud). "
+               "The answer key is shown here for testing only: the agents never see it.")
+    key = answer_key()
+    if key is None:
+        st.error(f"Answer key not found at {ANSWER_KEY_FILE}.")
+        return
+    try:
+        rows = pg_connection().execute(
+            "SELECT t.txn_id, t.published_at, (t.body->'payload'->>'amount')::numeric, "
+            "       t.body->'payload'->>'merchant', t.body->'payload'->>'category', d.score, d.decision, "
+            "       (SELECT r.decision FROM events r WHERE r.txn_id = t.txn_id "
+            "        AND r.event_type = 'transaction.resolved' ORDER BY r.published_at DESC LIMIT 1) "
+            "FROM events t "
+            "LEFT JOIN events d ON d.txn_id = t.txn_id AND d.event_type = 'transaction.decided' "
+            "WHERE t.event_type = 'transaction.received'").fetchall()
+    except psycopg.Error as error:
+        pg_connection.clear()
+        st.error(f"Can't reach PostgreSQL (is Docker running?): {error}")
+        return
+    df = pd.DataFrame(rows, columns=["txn_id", "arrived", "amount", "shop", "shop type", "score",
+                                     "first decision", "final outcome"])
+    if df.empty:
+        st.info("No payments yet. Start a replay on the Monitor page.")
+        return
+    df["shop"] = df["shop"].str.removeprefix("fraud_")
+    df["amount"] = df["amount"].astype(float)
+    df["answer key"] = [truth(key, t) for t in df["txn_id"]]
+    df["txn"] = df["txn_id"].str[:8]
+    df.loc[df["final outcome"] == "sent_to_analyst", "answer key"] = "hidden"   # don't sway the analyst
+    decided = df[df["first decision"].notna() & df["answer key"].isin(["FRAUD", "genuine"])]
+    stopped = decided["first decision"].isin(["flag", "hold"])
+    fraud = decided["answer key"] == "FRAUD"
+    genuine = decided["answer key"] == "genuine"
+
+    blocked = decided["final outcome"] == "blocked"
+    a, b, c, d, e, f = st.columns(6)
+    a.metric("Payments decided", len(decided))
+    b.metric("Frauds among them", int(fraud.sum()))
+    c.metric("Frauds caught", int((fraud & stopped).sum()))
+    d.metric("…blocked in the end", int((fraud & blocked).sum()))
+    e.metric("Frauds missed", int((fraud & ~stopped).sum()))
+    f.metric("False alarms", int((genuine & stopped).sum()))
+    if fraud.sum() and genuine.sum():
+        st.markdown(f"**Caught {(fraud & stopped).sum() / fraud.sum():.0%} of the frauds** at the first "
+                    f"decision, and stopped **{(genuine & stopped).sum() / genuine.sum():.1%} of the genuine "
+                    "payments** by mistake.")
+    st.caption("Caught = flagged or held by the first decision; 'blocked in the end' = its final outcome "
+               "was blocked. A false alarm is a genuine payment that was flagged or held. Payments "
+               "waiting for an analyst are left out (their answer is hidden), and so are payments "
+               "not in the dataset. Counts cover every payment in the audit log; Step 3 measures "
+               "one clean run properly.")
+
+    cols = ["txn", "amount", "shop", "shop type", "score", "first decision", "final outcome", "answer key"]
+    flagged = df[df["first decision"].isin(["flag", "hold"])]   # all of them, including hidden ones
+    st.subheader(f"Flagged or held: {len(flagged)}")
+    st.dataframe(flagged.sort_values("arrived", ascending=False)[cols], hide_index=True,
+                 width="stretch", column_config={"amount": st.column_config.NumberColumn(format="$%.2f"),
+                                                 "score": st.column_config.NumberColumn(format="%.2f")})
+    st.subheader(f"Frauds the system missed (approved): {int((fraud & ~stopped).sum())}")
+    st.dataframe(decided[fraud & ~stopped].sort_values("arrived", ascending=False)[cols[:6]],
+                 hide_index=True, width="stretch",
+                 column_config={"amount": st.column_config.NumberColumn(format="$%.2f"),
+                                "score": st.column_config.NumberColumn(format="%.3f")})
+    st.caption("Copy a txn into the Payment trace page to see its whole journey.")
+
+
+# ---------- SMS inbox page (Part 3 · Step 2) ----------
+
+def sms_page() -> None:
+    st.title("SMS inbox")
+    st.caption("Every text between the bank and its customers, as recorded by the mock SMS provider.")
+    try:
+        entries = redis_client().xrevrange(SMS_LOG, count=2000)   # newest first
+    except (redis.ConnectionError, redis.TimeoutError) as error:
+        st.error(f"Can't reach Redis (is Docker running?): {error}")
+        return
+    if not entries:
+        st.info("No texts yet. They appear when the system checks a payment with a customer.")
+        return
+    texts = [f for _, f in entries]
+    a, b, c = st.columns(3)
+    st.caption(f"Showing the latest {len(texts)} texts (the provider keeps about 5,000).")
+    a.metric("Texts sent by the bank", sum(t["direction"] == "out" for t in texts))
+    b.metric("Replies from customers", sum(t["direction"] == "in" for t in texts))
+    c.metric("Customers", len({t["who"] for t in texts}))
+
+    chats: dict[str, list[dict]] = {}
+    for t in texts:                                   # newest first, so the first is the latest
+        chats.setdefault(t["who"], []).append(t)
+    who = st.selectbox(
+        "Conversation (latest first)", list(chats), key="sms_who",
+        format_func=lambda w: f"{w} · {len(chats[w])} texts · last {chats[w][0]['at']} UTC")
+    for t in reversed(chats[who]):                    # oldest first, like a phone
+        mine = t["direction"] == "out"
+        with st.chat_message("assistant" if mine else "user", avatar="🏦" if mine else "👤"):
+            st.markdown(plain(t["text"]))
+            st.caption(f"{'Bank' if mine else 'Customer'} · {t['at']} UTC · txn {t['txn_id'][:8] or '—'}")
+
+
 st.navigation([
     st.Page(monitor_page, title="Monitor", icon="📊", default=True),
+    st.Page(trace_page, title="Payment trace", icon="🔎", url_path="trace"),
+    st.Page(caught_page, title="Caught payments", icon="🎯", url_path="caught"),
+    st.Page(sms_page, title="SMS inbox", icon="💬", url_path="sms"),
     st.Page(analyst_page, title="Analyst", icon="🧑‍💼", url_path="analyst"),
 ]).run()

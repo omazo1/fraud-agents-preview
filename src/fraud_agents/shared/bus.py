@@ -12,6 +12,7 @@ Every agent reads its input stream as a member of a consumer group, so:
 import logging
 import os
 import socket
+import threading
 import time
 from collections.abc import Callable
 
@@ -103,17 +104,33 @@ def consume(
     """
     consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
     ensure_group(r, stream, group)
+
+    # Renew the "I'm alive" note every 5 s from a side thread, so an agent busy with a
+    # long AI call (longer than the note's 15 s) still shows as running on the Monitor.
+    stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop.wait(5):
+            try:
+                r.set(alive_key(group, stream), consumer, ex=ALIVE_TTL_SECONDS)
+            except redis.RedisError:
+                pass   # Redis down: the main loop already reports and retries
+
+    threading.Thread(target=heartbeat, daemon=True, name=f"alive-{stream}").start()
     handled = 0
-    while stop_after is None or handled < stop_after:
-        try:
-            handled += _one_round(r, stream, group, handler, consumer, block_ms,
-                                  None if stop_after is None else stop_after - handled,
-                                  batch_size, reclaim_after_ms)
-        except (redis.ConnectionError, redis.TimeoutError) as error:
-            # Redis is restarting or unreachable: wait and try again; nothing is lost,
-            # because unacknowledged events stay in the stream.
-            log.warning("Redis unavailable (%s); retrying in 2 s", error)
-            time.sleep(2)
+    try:
+        while stop_after is None or handled < stop_after:
+            try:
+                handled += _one_round(r, stream, group, handler, consumer, block_ms,
+                                      None if stop_after is None else stop_after - handled,
+                                      batch_size, reclaim_after_ms)
+            except (redis.ConnectionError, redis.TimeoutError) as error:
+                # Redis is restarting or unreachable: wait and try again; nothing is lost,
+                # because unacknowledged events stay in the stream.
+                log.warning("Redis unavailable (%s); retrying in 2 s", error)
+                time.sleep(2)
+    finally:
+        stop.set()
     return handled
 
 
