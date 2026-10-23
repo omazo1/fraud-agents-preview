@@ -186,23 +186,33 @@ def control_panel() -> None:
     with st.sidebar:
         st.header("Control panel")
         st.caption("Sends real payments from fraudTest.csv through the gateway.")
-        genuine = st.number_input("Genuine payments", 0, 5000, 45, step=5)
-        fraud = st.number_input("Fraud payments", 0, 500, 5)
+        real_mix = st.toggle("Real fraud rate (random payments, ~0.4% fraud)", value=False,
+                             help="Off: choose how many genuine and fraud payments (a test mix with more "
+                                  "fraud, to see the slow lane work). On: random payments, so fraud comes "
+                                  "as rarely as in real card traffic.")
+        if real_mix:
+            natural = st.number_input("Payments", 50, 20000, 1000, step=50)
+            genuine, fraud = natural, 0
+        else:
+            natural = 0
+            genuine = st.number_input("Genuine payments", 0, 5000, 45, step=5)
+            fraud = st.number_input("Fraud payments", 0, 500, 5)
         rate = st.slider("Payments per second", 1, 50, 5)
         holder = replay_holder()
         busy = holder["process"] is not None and holder["process"].poll() is None
         st.session_state["sidebar_busy"] = busy   # what the sidebar buttons were drawn for
         if st.button("▶ Start replay", disabled=busy, type="primary"):
             try:
-                start_run(redis_client(), f"replay: {genuine} genuine + {fraud} fraud at {rate}/s",
-                          planned=genuine + fraud)
+                label = (f"replay: {natural} random payments (real fraud rate) at {rate}/s" if natural
+                         else f"replay: {genuine} genuine + {fraud} fraud at {rate}/s")
+                start_run(redis_client(), label, planned=genuine + fraud)
             except (redis.ConnectionError, redis.TimeoutError) as error:
                 st.error(f"Can't reach Redis (is Docker running?): {error}")
                 return
             REPLAY_LOG.parent.mkdir(parents=True, exist_ok=True)
             holder["process"] = subprocess.Popen(
-                [sys.executable, "-m", "fraud_agents.services.replayer.replay",
-                 "--genuine", str(genuine), "--fraud", str(fraud), "--rate", str(rate)],
+                [sys.executable, "-m", "fraud_agents.services.replayer.replay", "--rate", str(rate)]
+                + (["--natural", str(natural)] if natural else ["--genuine", str(genuine), "--fraud", str(fraud)]),
                 stdout=REPLAY_LOG.open("w"), stderr=subprocess.STDOUT,
             )
             st.rerun()

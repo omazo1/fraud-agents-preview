@@ -13,6 +13,7 @@ customer at the till:
 
 Run from the project folder (the gateway must be running):
     python -m fraud_agents.services.replayer.replay --genuine 45 --fraud 5 --rate 5
+    python -m fraud_agents.services.replayer.replay --natural 1000 --rate 10   # real mix (~0.4% fraud)
 """
 
 import argparse
@@ -34,12 +35,18 @@ SENT_FIELDS = [
 ]
 
 
-def pick(genuine: int, fraud: int, seed: int) -> pd.DataFrame:
+def pick(genuine: int, fraud: int, seed: int, natural: int = 0) -> pd.DataFrame:
+    """Chosen numbers of genuine and fraud payments (a test mix, e.g. 10% fraud), or with
+    `natural` that many payments drawn at random, so fraud comes at the test file's real
+    rate (about 0.4%), like real card traffic (feedback #3)."""
     df = pd.read_csv(TEST_FILE, usecols=SENT_FIELDS + ["is_fraud"], dtype={"cc_num": str})
-    chosen = pd.concat([
-        df[df.is_fraud == 0].sample(genuine, random_state=seed),
-        df[df.is_fraud == 1].sample(fraud, random_state=seed),
-    ])
+    if natural:
+        chosen = df.sample(natural, random_state=seed)
+    else:
+        chosen = pd.concat([
+            df[df.is_fraud == 0].sample(genuine, random_state=seed),
+            df[df.is_fraud == 1].sample(fraud, random_state=seed),
+        ])
     return chosen.sort_values("trans_date_trans_time")
 
 
@@ -96,6 +103,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--genuine", type=int, default=45)
     parser.add_argument("--fraud", type=int, default=5)
+    parser.add_argument("--natural", type=int, default=0,
+                        help="send this many RANDOM payments (real fraud rate, ~0.4%%) instead of --genuine/--fraud")
     parser.add_argument("--rate", type=float, default=5, help="payments per second")
     parser.add_argument("--seed", type=int, default=None, help="same seed = same payments")
     parser.add_argument("--url", default="http://localhost:8000/webhooks/payments")
@@ -105,8 +114,9 @@ def main() -> None:
 
     secret = config.require("WEBHOOK_SECRET")
     seed = args.seed if args.seed is not None else random.randint(1, 1_000_000)
-    rows = pick(args.genuine, args.fraud, seed)
-    print(f"Replaying {len(rows)} payments (seed {seed}) at {args.rate}/s to {args.url}\n")
+    rows = pick(args.genuine, args.fraud, seed, args.natural)
+    mix = f"real mix: {int(rows.is_fraud.sum())} fraud" if args.natural else "chosen mix"
+    print(f"Replaying {len(rows)} payments ({mix}, seed {seed}) at {args.rate}/s to {args.url}\n")
 
     base = args.url.split("/webhooks/")[0]
     counts: dict[str, int] = {}

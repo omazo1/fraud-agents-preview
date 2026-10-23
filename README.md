@@ -109,19 +109,19 @@ open http://localhost:8501
 ```
 
 - `start_all.sh` is written for a Mac. `SKIP_DOCKER=1` or `SKIP_OLLAMA=1` in front of it skips starting those.
-- In the Monitor, press **▶ Start replay** to send real payments from the test set through the system.
+- In the Monitor, press **▶ Start replay** to send real payments from the test set through the system. By default it is a *test mix* (e.g. 45 genuine + 5 fraud), so the slow lane has work to do. Switch on **Real fraud rate** to send random payments instead, so fraud is as rare as in real card traffic (about 0.4%). From the command line: `python -m fraud_agents.services.replayer.replay --natural 1000 --rate 10`.
 - `bash scripts/status.sh` shows what is running.
 - `bash scripts/stop_all.sh` stops everything.
 - Logs are in `data/logs/`.
 
 The trained model is saved in `models/`. To train it again: `python -m fraud_agents.agents.risk_scoring.train`.
 
-**Measure a run:** after a replay finishes (the Monitor's banner turns green), run `python -m fraud_agents.services.metrics.report`. It writes the headline numbers to `data/processed/run_report_<time>.md`. The answer key is used only by this report and the Monitor's testing pages; the agents never see it.
+**Measure a run:** after a replay finishes (the Monitor's banner turns green), run `python -m fraud_agents.services.metrics.report`. It writes the headline numbers to `data/processed/run_report_<time>.md`. Its section **"At the real fraud rate"** shows the numbers that hold at real volume: false alarms per million genuine payments, how precision falls as fraud gets rarer (0.1–0.5%), and how many genuine customers a bank with a million payments a day would decline by mistake. These come from the model's test on the whole test file; a short replay is only a sample. The answer key is used only by this report and the Monitor's testing pages; the agents never see it.
 
 ## Tests
 
 ```bash
-pytest                 # about 170 tests in a few seconds
+pytest                 # about 180 tests in about 20 seconds
 ```
 
 - The tests need no Llama and no dataset. The bus, gateway and outcome-rule tests need Redis (`docker compose up -d`) and skip themselves without it. They use a separate Redis database (15), so they never touch a running system.

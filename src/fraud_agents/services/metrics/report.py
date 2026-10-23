@@ -24,8 +24,61 @@ ANSWER_KEY_FILE = Path("data/raw/fraudTest.csv")
 OUT_DIR = Path("data/processed")
 RUN_KEY = "monitor:run"   # written by the Monitor when a run starts
 FAR_FUTURE = datetime(9999, 1, 1, tzinfo=timezone.utc)
-# Part 1 · Step 4: the model alone on the whole test file (555,719 payments) at the flag line (0.5).
-OFFLINE = {"caught": 1427, "frauds": 2145, "false_alarms": 397, "genuine": 553574}
+BANK_PAYMENTS_PER_DAY = 1_000_000   # an illustration of "real volume" for section 1b
+REAL_RATES = (0.001, 0.004, 0.005)  # the range of real card-fraud rates given in feedback #3
+
+
+def offline_test() -> dict:
+    """The live model's own test on the WHOLE test file (the real mix, 0.39% fraud) at the
+    Decision agent's flag line, from the model's details file. These are the numbers that
+    hold at the real fraud rate; a short replay's numbers are only a sample."""
+    from fraud_agents.agents.decision.agent import load_rules
+    from fraud_agents.agents.risk_scoring.agent import META_FILE
+    meta = json.loads(META_FILE.read_text())
+    flag_at = load_rules()["flag_at"]
+    line = meta["test"]["at_threshold"][str(flag_at)]
+    frauds = meta["test"]["fraud_rows"]
+    return {"model": meta["model_version"], "flag_at": flag_at, "caught": line["caught"],
+            "frauds": frauds, "false_alarms": line["false_alarms"],
+            "genuine": meta["test"]["rows"] - frauds}
+
+
+def precision_at(rate: float, recall: float, false_alarm_rate: float) -> float:
+    """Of the payments stopped, the share that is fraud, if fraud is `rate` of all traffic."""
+    return recall * rate / (recall * rate + false_alarm_rate * (1 - rate))
+
+
+def real_rate_section(off: dict, run_fraud: int, run_total: int, test_days: float) -> list[str]:
+    recall = off["caught"] / off["frauds"]
+    far = off["false_alarms"] / off["genuine"]
+    per_million = far * 1_000_000
+    lo, hi = wilson_bounds(off["false_alarms"], off["genuine"])
+    test_rate = off["frauds"] / (off["frauds"] + off["genuine"])
+    per_day = (off["frauds"] + off["genuine"]) / test_days
+    bank_frauds = BANK_PAYMENTS_PER_DAY * 0.004
+    return [
+        "## 1b. At the real fraud rate",
+        "",
+        f"- This run was **{pct(run_fraud, run_total)} fraud**. Real card traffic is about 0.1–0.5% fraud; this"
+        f" dataset's test file is {test_rate:.2%} ({off['frauds']:,} of {off['frauds'] + off['genuine']:,}).",
+        f"- The numbers that hold at the real rate come from the model's test on the **whole test file**"
+        f" ({off['model']}, flag line {off['flag_at']}):",
+        "",
+        "| Catch rate | False alarms per million genuine payments | Precision at the test file's rate |",
+        "| --- | --- | --- |",
+        f"| {recall:.1%} ({off['caught']:,} of {off['frauds']:,}) | **{per_million:,.0f}** (95% range"
+        f" {lo * 1e6:,.0f}–{hi * 1e6:,.0f}) | {precision_at(test_rate, recall, far):.1%} |",
+        "",
+        "- **Precision falls as fraud gets rarer:** "
+        + "; ".join(f"at {r:.1%} fraud, {precision_at(r, recall, far):.0%} of stopped payments are fraud"
+                    for r in REAL_RATES) + ".",
+        f"- **At real volume:** a bank with {BANK_PAYMENTS_PER_DAY:,} card payments a day (0.4% fraud) would stop"
+        f" about **{far * BANK_PAYMENTS_PER_DAY * (1 - 0.004):,.0f} genuine payments a day by mistake**, each one a soft"
+        f" decline and a \"was this you?\" text, while catching about {recall * bank_frauds:,.0f} of its"
+        f" {bank_frauds:,.0f} frauds. (This dataset's bank has about {per_day:,.0f} payments a day:"
+        f" about {far * per_day:.1f} false alarms a day.)",
+        "",
+    ]
 
 
 def run_start(since: str | None) -> tuple[datetime, str, datetime | None]:
@@ -42,14 +95,19 @@ def run_start(since: str | None) -> tuple[datetime, str, datetime | None]:
     return datetime.fromisoformat(run["started_at"]), run.get("label", ""), done
 
 
-def wilson(k: int, n: int) -> str:
+def wilson_bounds(k: int, n: int) -> tuple[float, float]:
     """The 95% range for a rate measured as k out of n (Wilson interval)."""
-    if not n:
-        return "n/a"
     z, ph = 1.96, k / n
     centre = (ph + z * z / (2 * n)) / (1 + z * z / n)
     half = z * math.sqrt(ph * (1 - ph) / n + z * z / (4 * n * n)) / (1 + z * z / n)
-    return f"{max(0, centre - half):.1%}–{min(1, centre + half):.1%}"
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def wilson(k: int, n: int) -> str:
+    if not n:
+        return "n/a"
+    lo, hi = wilson_bounds(k, n)
+    return f"{lo:.1%}–{hi:.1%}"
 
 
 def load(start: datetime, until: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -85,8 +143,11 @@ def build(start: datetime, label: str, completed: datetime | None = None,
     events, calls = load(start, until)
     if events.empty:
         raise SystemExit("No payments arrived in this run yet.")
-    key_df = pd.read_csv(ANSWER_KEY_FILE, usecols=["trans_num", "is_fraud"])
+    key_df = pd.read_csv(ANSWER_KEY_FILE, usecols=["trans_num", "is_fraud", "trans_date_trans_time"])
     key = dict(zip(key_df["trans_num"], key_df["is_fraud"]))
+    span = pd.to_datetime(key_df["trans_date_trans_time"])
+    test_days = (span.max() - span.min()).total_seconds() / 86400
+    offline = offline_test()
 
     first = events.drop_duplicates(["txn_id", "type"], keep="first").set_index(["txn_id", "type"])
     latest = events.drop_duplicates(["txn_id", "type"], keep="last").set_index(["txn_id", "type"])
@@ -129,8 +190,8 @@ def build(start: datetime, label: str, completed: datetime | None = None,
 
     last_event = completed or events["at"].max()   # the Monitor's frozen completion time, if any
     in_progress = int((decided["stopped"] & decided["final"].isna()).sum())
-    off_recall = OFFLINE["caught"] / OFFLINE["frauds"]
-    off_false = OFFLINE["false_alarms"] / OFFLINE["genuine"]
+    off_recall = offline["caught"] / offline["frauds"]
+    off_false = offline["false_alarms"] / offline["genuine"]
     all_frauds = int(p["fraud"].sum())
 
     fast = (decided["decided_at"] - decided["arrived"]).dt.total_seconds()
@@ -184,17 +245,21 @@ def build(start: datetime, label: str, completed: datetime | None = None,
         f"- **Catch rate (recall): {pct(tp, tp + fn)}** of frauds ({tp} of {tp + fn}; 95% range {wilson(tp, tp + fn)}).",
         f"- **False-alarm rate: {pct(fp, fp + tn)}** of genuine payments were stopped ({fp} of {fp + tn};"
         f" 95% range {wilson(fp, fp + tn)}).",
-        f"- **Precision in this run: {pct(tp, tp + fp)}** of flagged or held payments were fraud. *Not comparable"
-        f" with real traffic:* this run is {pct(tp + fn, len(decided))} fraud, real card traffic about 0.4%,"
-        " and precision falls when fraud is rarer.",
-        f"- **Same model, same line as Part 1.** The first decision is the XGBoost model alone at 0.5, so the"
-        f" fair comparison is with Part 1's test on the whole test file: catch rate {off_recall:.1%}"
-        f" ({OFFLINE['caught']} of {OFFLINE['frauds']}), false-alarm rate {off_false:.2%}"
-        f" ({OFFLINE['false_alarms']} of {OFFLINE['genuine']:,}). A difference inside the 95% range above is"
+        f"- **Precision in this run: {pct(tp, tp + fp)}** of flagged or held payments were fraud. "
+        + (f"This run used about the real fraud rate ({pct(tp + fn, len(decided))}), but with only {tp + fn}"
+           " frauds it is a small sample; section 1b has the numbers that hold at scale."
+           if len(decided) and (tp + fn) / len(decided) < 0.01 else
+           f"*Not comparable with real traffic:* this run is {pct(tp + fn, len(decided))} fraud, real card"
+           " traffic about 0.1–0.5%, and precision falls when fraud is rarer (see section 1b)."),
+        f"- **Same model, same line as its offline test.** The first decision is the XGBoost model alone at"
+        f" {offline['flag_at']}, so the fair comparison is with its test on the whole test file: catch rate {off_recall:.1%}"
+        f" ({offline['caught']} of {offline['frauds']}), false-alarm rate {off_false:.2%}"
+        f" ({offline['false_alarms']} of {offline['genuine']:,}). A difference inside the 95% range above is"
         " sampling noise, not a change in the model.",
         f"- By decision: {int((fraud['decision'] == 'hold').sum())} frauds held, {int((fraud['decision'] == 'flag').sum())} flagged;"
         f" {int((genuine['decision'] == 'hold').sum())} genuine held, {int((genuine['decision'] == 'flag').sum())} flagged.",
         "",
+        *real_rate_section(offline, tp + fn, len(decided), test_days),
         "## 2. Final outcomes (after the AI agents, the customer and any analyst)",
         "",
         "| Final outcome | Fraud | Genuine |",
