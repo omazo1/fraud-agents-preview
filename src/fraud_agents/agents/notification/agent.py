@@ -49,32 +49,39 @@ log = logging.getLogger(PRODUCER)
 
 # What each outcome means for the customer, and the word the text must contain.
 # The key is the resolution, or "resolution/rule_id" where the reason changes the wording.
+# How long a confirmed retry is allowed for (the gateway uses the same setting).
+RETRY_MINUTES = int(os.environ.get("RETRY_WINDOW_SECONDS", str(30 * 60))) // 60
+
 OUTCOMES = {
     "blocked": ("we blocked the payment, because you told us it was not you",
                 "blocked"),
-    "released/customer_confirmed": ("the payment is approved, because you confirmed you made it",
-                                    "approved"),
-    "released": ("we checked the payment, it looks normal, and it is approved", "approved"),
+    "released/customer_confirmed": ("you confirmed you made it, so if you try the payment again "
+                                    f"within {RETRY_MINUTES} minutes it will be approved", "approved"),
+    "released": ("we checked the payment and it looks normal, so if you try it again within "
+                 f"{RETRY_MINUTES} minutes it will be approved", "approved"),
     "sent_to_analyst": ("a member of our fraud team is reviewing the payment and will contact you",
                         "review"),
     "blocked/analyst_blocked": ("our fraud team reviewed the payment and blocked it",
                                 "blocked"),
-    "released/analyst_released": ("our fraud team reviewed the payment and it is approved", "approved"),
+    "released/analyst_released": ("our fraud team reviewed the payment, so if you try it again "
+                                  f"within {RETRY_MINUTES} minutes it will be approved", "approved"),
 }
 
 TEMPLATES = {
     "blocked": "Bank: we blocked the ${amount} payment at {merchant} because you told us it "
                "wasn't you.",
-    "released/customer_confirmed": "Bank: thanks for confirming. The ${amount} payment at "
-                                   "{merchant} is approved.",
-    "released": "Bank: we checked the ${amount} payment at {merchant}. It is approved, and you "
-                "don't need to do anything.",
+    "released/customer_confirmed": "Bank: thanks for confirming. Please try the ${amount} payment "
+                                   "at {merchant} again within " + str(RETRY_MINUTES) + " minutes; "
+                                   "it will be approved.",
+    "released": "Bank: we checked the ${amount} payment at {merchant}. Please try it again within "
+                + str(RETRY_MINUTES) + " minutes; it will be approved.",
     "sent_to_analyst": "Bank: our fraud team is reviewing the ${amount} payment at {merchant} "
                        "and will contact you soon.",
     "blocked/analyst_blocked": "Bank: our fraud team reviewed the ${amount} payment at {merchant} "
                                "and blocked it.",
     "released/analyst_released": "Bank: our fraud team reviewed the ${amount} payment at {merchant}. "
-                                 "It is approved, and you don't need to do anything.",
+                                 "Please try it again within " + str(RETRY_MINUTES) + " minutes; "
+                                 "it will be approved.",
 }
 
 # The last resort if even a template failed its checks: says nothing it can't stand behind.

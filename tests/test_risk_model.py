@@ -33,3 +33,10 @@ def test_an_unknown_shop_type_is_refused(scorer, payment):
     odd = payment.model_copy(update={"payload": payment.payload.model_copy(update={"category": "space_travel"})})
     with pytest.raises(ValueError):
         scorer.score(odd)
+
+
+def test_a_confirmed_retry_is_passed_on_to_the_decision_rules(scorer, payment):
+    retry = payment.model_copy(update={"payload": payment.payload.model_copy(
+        update={"confirmed_retry_of": "first-txn"})})
+    assert scorer.score(retry).payload.confirmed_retry_of == "first-txn"
+    assert scorer.score(payment).payload.confirmed_retry_of is None

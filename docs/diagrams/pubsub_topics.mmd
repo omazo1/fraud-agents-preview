@@ -37,26 +37,26 @@ flowchart LR
       direction TB
       s1[Risk Scoring]:::sub
       s2[Decision]:::sub
-      s3[Investigation]:::sub
+      s3[Investigation + Gateway]:::sub
       s4[Decision + Verification]:::sub
       s5[Decision]:::sub
       s6[record only]:::quiet
       s7[Verification]:::sub
       s8[Decision]:::sub
-      s9[Notification]:::sub
+      s9[Notification + Gateway]:::sub
       s10[record only]:::quiet
       s11[Decision]:::sub
     end
     p1-->t1-->s1
     p2-->t2-->s2
-    p3-->t3-->s3
+    p3-->t3==>s3
     p4-->t4==>s4
     p5-->t5-->s5
     p6-->t6-.->s6
     p7-->t7-->s7
     p8-->t8-->s8
-    p9-->t9-->s9
+    p9-->t9==>s9
     p10-->t10-.->s10
     p11-->t11-->s11
-    A[["Audit service: subscribes to ALL 11 topics → PostgreSQL → live Monitor"]]:::quiet
+    A[["Audit service: subscribes to ALL 11 topics → PostgreSQL → live Monitor.<br/>Gateway: subscribes to transaction.decided (to answer the till) and transaction.resolved (payment status, retries)."]]:::quiet
     S ~~~ A

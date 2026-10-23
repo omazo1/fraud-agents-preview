@@ -18,10 +18,11 @@ Every event is kept in a PostgreSQL audit log, and a Streamlit Monitor shows it 
 ## How a payment flows
 
 ```
-replayer --signed webhook--> gateway --> Risk Scoring (XGBoost) --> Decision (rules)
-                                                                     approve | flag | hold
-                                                                             | flag or hold
-                                                                             v
+payment source --signed webhook--> gateway --> Risk Scoring (XGBoost) --> Decision (rules)
+        ^                             |                                    approve | flag | hold
+        |   answer in ~25 ms:         |   <-- transaction.decided --------------+
+        +-- approved, or declined ----+                                            | flag or hold
+            (soft) for now                                                         v
    Investigation (AI: LangGraph, 3 tools, checked report)
       --> Verification (AI + rules: texts the customer, pauses until the reply, saved in PostgreSQL)
              <--signed reply webhook-- mock SMS provider (simulated customer)
@@ -32,6 +33,21 @@ replayer --signed webhook--> gateway --> Risk Scoring (XGBoost) --> Decision (ru
 every event --> audit log (PostgreSQL) --> Fraud System Monitor (Streamlit)
 every AI call --> llm_calls table
 ```
+
+### The answer at the till
+
+A card network needs the bank's answer in a few hundred milliseconds, so the slow lane (AI investigation, texting the customer) can't happen before it. The gateway therefore:
+
+1. publishes the payment and **waits up to 300 ms** (`DECISION_DEADLINE_MS`) for the Decision agent's verdict. It *listens live* to `transaction.decided`: every gateway process reads each new verdict, and old ones are never replayed. In replays with the real Risk Scoring (XGBoost + SHAP) and Decision agents, the answer came back in a median of about 20–25 ms (slowest about 50 ms, on a sandbox machine);
+2. answers **approved** (low risk) or **declined (soft)**. A *soft decline* means "declined for now": the customer gets a "did you just try to pay…?" text. No verdict in time also gives a soft decline, and the customer simply taps again;
+3. keeps each payment's status (it also subscribes to `transaction.resolved`, as a durable consumer group). The payment source can ask at any time: `GET /payments/{txn_id}` (signed over the method and path). For example, it might answer "declined for now: waiting for the customer to confirm";
+4. when the customer replies **YES** (or an analyst releases the payment), allows **one** retry within 30 minutes (`RETRY_WINDOW_SECONDS`) of the same card, shop (name, type and location) and amount. The retry is marked `confirmed_retry_of`, and the Decision rules approve it. If that retry itself gets no verdict in time, the YES is kept for the next try.
+
+A payment gets exactly **one** answer:
+- a resent webhook gets the same answer as the first request (the payment is claimed atomically with `SET NX`, and the answer is stored once with `HSETNX`);
+- if the gateway dies mid-wait, a resend gets a soft decline. Nothing has moved, so the customer simply tries again.
+
+The replayer plays the card terminal and the customer at the till. It prints each answer and how long it took, and it retries the payments the customers confirmed.
 
 ### How Pub/Sub works here
 
@@ -53,9 +69,9 @@ The step-by-step flow of one payment, event by event, is in [docs/images/sequenc
 
 | Program | What it does | Technology |
 | --- | --- | --- |
-| Gateway | Receives signed payment webhooks and customer-reply webhooks; replaces card numbers with keyed tokens; refuses the dataset's answer key | FastAPI, HMAC-SHA256 |
+| Gateway | Receives signed payment webhooks and customer-reply webhooks. Replaces card numbers with keyed tokens and refuses the dataset's answer key. **Answers each payment** (approved / soft-declined), keeps its status (`GET /payments/{id}`) and allows a confirmed retry | FastAPI, HMAC-SHA256 |
 | Risk Scoring agent | Scores every payment from 0 to 1 and gives the top reasons | XGBoost, SHAP values |
-| Decision agent | Plain rules: hold ≥ 0.90, flag ≥ 0.50, otherwise approve; later the final outcome | Python rules in JSON files |
+| Decision agent | Plain rules: hold ≥ 0.90, flag ≥ 0.50, otherwise approve (a retry the customer confirmed is always approved); later the final outcome | Python rules in JSON files |
 | Investigation agent | Uses tools on the card's history and the shop type, then writes a checked report | LangGraph, LangChain tools, Llama 3.1 8B |
 | Verification agent | Texts the customer, **pauses** until the reply (or a timeout), reads the reply | LangGraph `interrupt()` + PostgreSQL checkpointer |
 | Notification agent | Writes the outcome text; plain rules check it; a fixed template if it fails | LangGraph, Llama |
@@ -105,7 +121,7 @@ The trained model is saved in `models/`. To train it again: `python -m fraud_age
 ## Tests
 
 ```bash
-pytest                 # about 165 tests in a few seconds
+pytest                 # about 170 tests in a few seconds
 ```
 
 - The tests need no Llama and no dataset. The bus, gateway and outcome-rule tests need Redis (`docker compose up -d`) and skip themselves without it. They use a separate Redis database (15), so they never touch a running system.
@@ -121,7 +137,7 @@ They cover:
 - the outcome rules (the first final outcome wins; an analyst can replace only a waiting case; no outdated texts);
 - the model;
 - the bus (duplicates, every subscriber gets every event, a subscriber that was down or crashed still gets it, failures handed to a human);
-- the gateway;
+- the gateway (the answer at the till, soft decline, a confirmed retry approved once, the signed status);
 - the SMS provider (one text per key; replies survive a restart).
 
 ## Project layout
@@ -141,7 +157,7 @@ docs/          the Pub/Sub and sequence diagrams (images and Mermaid sources)
 ## Safety choices (and their limits)
 
 - **Rules decide, the AI advises.**
-  - **No payment is ever released by an AI alone.** A flagged or held payment is released only by the customer's clear "yes" (read by plain rules) or by an analyst.
+  - **No payment is ever released by an AI alone.** A flagged or held payment is soft-declined at the till. A retry is approved only after the customer's clear "yes" (read by plain rules) or an analyst's release.
   - A customer's reply is decided by plain rules only when it is a clean yes or no. When the AI has to read a reply, its "yes" is not enough: a human decides. Its "no" counts only if the reply has no yes-word.
   - When the Investigation agent recommends "no further action", the customer is still asked. Two reviews showed that no word-matching check can make an AI's evidence trustworthy enough to release a payment by itself (e.g. "shopped here 22 times" matched the "22 km" in the facts). The evidence check (every number must appear in a tool result, in a sentence sharing a specific word) is kept as a note in the log. `ALLOW_AI_RELEASE` in `agents/investigation/agent.py` switches the old behaviour back on.
 - **No case is lost.** Events are kept in durable Redis Streams until every subscriber has handled them (see "How Pub/Sub works here"). If an agent keeps failing on a flagged or held payment, the payment goes to the analyst queue before the failed event is set aside.
@@ -159,6 +175,9 @@ docs/          the Pub/Sub and sequence diagrams (images and Mermaid sources)
   - Customer texts state only what happened to the **payment** (the system doesn't protect, freeze or replace cards). If even a template failed its checks, a neutral "please check your banking app" text is sent instead.
   - Word lists for unsafe texts are never complete; the fixed template is the safety net.
   - A local 8B model handles one investigation at a time, so the AI checks queue up under load.
+  - The 300 ms deadline is for this laptop setup. A real issuer has a tighter, network-set budget, and would also need a "stand-in" policy for when its systems are down. Here, no verdict in time simply gives a soft decline.
+  - **The customer waits for the text.** Here the AI investigation runs first, so the "did you just try to pay…?" text comes after it: seconds in tests, but minutes when the local Llama is busy. A real bank would text first and investigate in parallel.
+  - A confirmed retry skips the model, so whoever holds the card details could use it within the 30 minutes, at the same shop for the same amount. That window is kept small on purpose.
 
 ## Credits
 

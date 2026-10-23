@@ -72,6 +72,9 @@ class TransactionReceivedPayload(Form):
     home_lat: float = Field(ge=-90, le=90)
     home_long: float = Field(ge=-180, le=180)
     city_pop: int = Field(ge=0)
+    # Soft decline + retry (feedback #2): set when this payment repeats one the customer
+    # confirmed ("YES, it was me") or an analyst released, within the retry window.
+    confirmed_retry_of: str | None = None
 
 
 class TransactionReceived(Envelope):
@@ -86,6 +89,7 @@ class RiskScoredPayload(Form):
     score: float = Field(ge=0, le=1)
     model_version: str
     top_factors: list[str] = Field(default_factory=list)
+    confirmed_retry_of: str | None = None   # copied from the payment, for the Decision rules
 
 
 class RiskScored(Envelope):

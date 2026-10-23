@@ -75,6 +75,7 @@ class RiskScorer:
                 score=round(score, 6),
                 model_version=self.meta["model_version"],
                 top_factors=top_factors,
+                confirmed_retry_of=event.payload.confirmed_retry_of,
             ),
         )
 

@@ -1,8 +1,10 @@
 """The Decision agent (Part 1 · Step 6, extended in Part 2 · Step 6). Plain rules, no AI.
 
 1. First decision: reads "I scored it" forms (risk.scored) and publishes "I decided"
-   forms (transaction.decided): approve, flag (let it through, investigate afterwards)
-   or hold (pause it until checked). The lines live in rules_v1.json.
+   forms (transaction.decided): approve, flag or hold. The lines live in rules_v1.json.
+   The gateway turns this into the answer at the till (feedback #2): approve = approved;
+   flag or hold = a SOFT decline (declined for now, the customer is asked, and a retry is
+   approved if they confirm). A retry the customer confirmed is always approved.
 2. Final outcome: reads the slow lane's results (verification.completed,
    investigation.completed, case.escalated) and publishes transaction.resolved:
    released, blocked or sent_to_analyst. The rules live in resolution_rules_v1.json.
@@ -56,7 +58,10 @@ def load_rules(path: Path = RULES_FILE) -> dict:
 def decide(scored: RiskScored, rules: dict) -> TransactionDecided:
     """Apply the rule book to one score. The same score always gives the same decision."""
     score = scored.payload.score
-    if score >= rules["hold_at"]:
+    if scored.payload.confirmed_retry_of:
+        # The customer said "YES, it was me" (or an analyst released it) and is trying again.
+        decision, rule_id = "approve", "customer_confirmed_retry"
+    elif score >= rules["hold_at"]:
         decision, rule_id = "hold", "score_at_or_above_hold_line"
     elif score >= rules["flag_at"]:
         decision, rule_id = "flag", "score_at_or_above_flag_line"

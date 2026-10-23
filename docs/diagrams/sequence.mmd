@@ -2,7 +2,7 @@
 sequenceDiagram
     title Fraud Agents: how one payment flows through the system (event by event)
     autonumber
-    participant R as Replayer<br/>(payment source)
+    participant R as Payment source<br/>(card terminal)
     participant G as Gateway<br/>(FastAPI)
     participant B as Redis Streams<br/>message bus
     participant RS as Risk Scoring<br/>(XGBoost)
@@ -14,24 +14,21 @@ sequenceDiagram
     participant A as Analyst<br/>(Streamlit Monitor)
 
     rect rgb(232, 241, 252)
-    Note over R,B: ① A payment arrives
+    Note over R,D: ① A payment arrives and gets its answer at the till (median ≈ 25 ms, deadline 300 ms)
     R->>G: POST /webhooks/payments (HMAC-signed)
-    Note over G: Check signature · card number → token · refuse the answer key
+    Note over G: Check signature · card number → token · refuse the answer key · start waiting
     G->>B: XADD → events:transaction.received
-    G-->>R: 202 Accepted
-    end
-
-    rect rgb(234, 247, 236)
-    Note over B,D: ② Score and decide (every payment)
     B->>RS: transaction.received
     RS->>B: risk.scored (score 0–1 + top SHAP reasons)
     B->>D: risk.scored
     D->>B: transaction.decided: approve (< 0.50) · flag (≥ 0.50) · hold (≥ 0.90)
+    B->>G: transaction.decided (the gateway subscribes too)
+    G-->>R: 200 approved · or declined (soft): "verify with customer" · no verdict in time → soft decline
     Note over D: approve → finished here
     end
 
     rect rgb(253, 240, 230)
-    Note over B,I: ③ Investigate (flag or hold only)
+    Note over B,I: ② Investigate (flag or hold only: soft-declined)
     B->>I: transaction.decided
     Note over I: Llama calls 3 tools (card recent activity, card spending profile, shop type risk) → report → rule checks
     I->>B: investigation.completed: verify_with_customer · escalate_to_analyst
@@ -39,11 +36,12 @@ sequenceDiagram
     end
 
     rect rgb(243, 236, 252)
-    Note over B,S: ④ Ask the customer
+    Note over R,S: ③ Ask the customer
     B->>V: investigation.completed
     V->>B: verification.requested
     V->>S: POST /messages "Was this you?" (API key + Idempotency-Key)
     Note over V: interrupt() → paused, state saved in PostgreSQL
+    R->>G: GET /payments/{id} (signed) → "declined for now: waiting for the customer"
     S->>G: POST /webhooks/sms-replies (HMAC-signed reply)
     G->>B: customer.replied
     B->>V: customer.replied
@@ -52,7 +50,7 @@ sequenceDiagram
     end
 
     rect rgb(234, 247, 236)
-    Note over B,N: ⑤ Final outcome and customer text
+    Note over R,N: ④ Final outcome and customer text
     B->>D: verification.completed (or escalate_to_analyst)
     Note over D: One final outcome per payment (first one wins)
     D->>B: transaction.resolved: released · blocked · sent_to_analyst
@@ -60,15 +58,25 @@ sequenceDiagram
     Note over N: Llama drafts text → rules check it → safe template if it fails
     N->>S: POST /messages (outcome text)
     N->>B: notification.sent
+    B->>G: transaction.resolved → payment status · released = ONE retry allowed (30 min)
     end
 
     rect rgb(252, 234, 236)
-    Note over B,A: ⑥ Human analyst (sent_to_analyst only)
+    Note over B,A: ⑤ Human analyst (sent_to_analyst only)
     Note over A: Case shows on the Analyst page
     A->>B: case.reviewed: release · block
     B->>D: case.reviewed
     D->>B: transaction.resolved (replaces sent_to_analyst)
-    B->>N: transaction.resolved → customer text as in ⑤
+    B->>N: transaction.resolved → customer text as in ④
+    end
+
+    rect rgb(232, 241, 252)
+    Note over R,D: ⑥ The customer said YES and taps again (same card, shop and amount)
+    R->>G: POST /webhooks/payments (a new payment)
+    Note over G: Matches the YES → marks it confirmed_retry_of (used once)
+    G->>B: transaction.received → Risk Scoring → Decision: approve (customer_confirmed_retry)
+    B->>G: transaction.decided
+    G-->>R: 200 approved
     end
 
     Note over R,A: Every event on every stream is also saved by the Audit service to PostgreSQL, which feeds the live Monitor. An event that fails 3 times goes to events:dead, and its case goes to the analyst.

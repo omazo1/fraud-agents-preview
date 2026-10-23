@@ -117,6 +117,7 @@ def consume(
     batch_size: int = 10,
     reclaim_after_ms: int = RECLAIM_AFTER_MS,
     on_give_up: Callable | None = None,
+    stop_event: threading.Event | None = None,
 ) -> int:
     """Read events from `stream` forever and pass each one to `handler`.
 
@@ -125,6 +126,7 @@ def consume(
     event is never picked up again while it is still being worked on.
     `on_give_up(event, reason)` runs when an event is about to be set aside after failing
     MAX_DELIVERIES times (Part 3 · Step 3: agents use it to hand the payment to a human).
+    `stop_event` (optional) ends the loop when set, within block_ms.
     """
     consumer = consumer or f"{socket.gethostname()}-{os.getpid()}"
     ensure_group(r, stream, group)
@@ -143,7 +145,7 @@ def consume(
     threading.Thread(target=heartbeat, daemon=True, name=f"alive-{stream}").start()
     handled = 0
     try:
-        while stop_after is None or handled < stop_after:
+        while (stop_after is None or handled < stop_after) and not (stop_event and stop_event.is_set()):
             try:
                 handled += _one_round(r, stream, group, handler, consumer, block_ms,
                                       None if stop_after is None else stop_after - handled,

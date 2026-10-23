@@ -27,6 +27,13 @@ def test_first_decision_lines(score, decision):
     assert decide(scored, RULES).payload.decision == decision
 
 
+def test_a_retry_the_customer_confirmed_is_approved_even_with_a_high_score():
+    scored = RiskScored(**label(payload=RiskScoredPayload(score=0.99, model_version="test",
+                                                          confirmed_retry_of="t0")))
+    decided = decide(scored, RULES)
+    assert (decided.payload.decision, decided.payload.rule_id) == ("approve", "customer_confirmed_retry")
+
+
 def test_the_same_score_always_gives_the_same_decision_and_id():
     scored = RiskScored(**label(payload=RiskScoredPayload(score=0.7, model_version="test")))
     first, again = decide(scored, RULES), decide(scored, RULES)

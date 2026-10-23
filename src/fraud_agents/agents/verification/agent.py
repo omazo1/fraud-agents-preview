@@ -12,7 +12,7 @@ wait for the reply for as long as needed, even if the agent is stopped and resta
                                                   v
                                                finish -> verification.completed
 
-- ask_customer: texts "did you just pay $X at Y? Reply YES or NO" through the SMS
+- ask_customer: texts "did you just try to pay $X at Y? Reply YES or NO" through the SMS
   provider, and publishes verification.requested (its event_id is the reference the
   reply comes back with).
 - wait_for_reply: interrupt() pauses the graph; the state is saved in PostgreSQL.
@@ -282,7 +282,7 @@ class Verifier:
                 log.info("txn %s  already being verified", report.txn_id[:8])
             return
         payment = payment_details(report.txn_id)
-        question = (f"Bank alert: did you just pay ${payment['amount']:.2f} at {payment['merchant']}? "
+        question = (f"Bank alert: did you just try to pay ${payment['amount']:.2f} at {payment['merchant']}? "
                     "Reply YES or NO.")
         self.graph.invoke({
             "txn_id": report.txn_id, "card_id": payment["card_id"],
