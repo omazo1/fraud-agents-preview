@@ -1,0 +1,62 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"DejaVu Sans","fontSize":"15px","primaryColor":"#1f3a5f","primaryTextColor":"#ffffff","primaryBorderColor":"#1f3a5f","lineColor":"#5b6b7d","clusterBkg":"#f7f9fc","clusterBorder":"#c9d3df","titleColor":"#1f3a5f"},"flowchart":{"nodeSpacing":14,"rankSpacing":55,"curve":"basis"}}}%%
+flowchart LR
+    classDef pub fill:#1f3a5f,stroke:#1f3a5f,color:#fff
+    classDef topic fill:#fff6d6,stroke:#d9b44a,color:#1d1d1d
+    classDef sub fill:#e8f1fc,stroke:#1f3a5f,color:#1d1d1d
+    classDef quiet fill:#f1f1f1,stroke:#9aa7b6,color:#555,stroke-dasharray: 4 3
+
+    subgraph P[" PUBLISHERS "]
+      direction TB
+      p1[Gateway]:::pub
+      p2[Risk Scoring]:::pub
+      p3[Decision]:::pub
+      p4[Investigation]:::pub
+      p5[Investigation · Verification]:::pub
+      p6[Verification]:::pub
+      p7[Gateway]:::pub
+      p8[Verification]:::pub
+      p9[Decision]:::pub
+      p10[Notification]:::pub
+      p11[Analyst page]:::pub
+    end
+    subgraph T[" TOPICS · one Redis Stream each "]
+      direction TB
+      t1([transaction.received]):::topic
+      t2([risk.scored]):::topic
+      t3([transaction.decided]):::topic
+      t4([investigation.completed]):::topic
+      t5([case.escalated]):::topic
+      t6([verification.requested]):::topic
+      t7([customer.replied]):::topic
+      t8([verification.completed]):::topic
+      t9([transaction.resolved]):::topic
+      t10([notification.sent]):::topic
+      t11([case.reviewed]):::topic
+    end
+    subgraph S[" SUBSCRIBERS · one consumer group each "]
+      direction TB
+      s1[Risk Scoring]:::sub
+      s2[Decision]:::sub
+      s3[Investigation]:::sub
+      s4[Decision + Verification]:::sub
+      s5[Decision]:::sub
+      s6[record only]:::quiet
+      s7[Verification]:::sub
+      s8[Decision]:::sub
+      s9[Notification]:::sub
+      s10[record only]:::quiet
+      s11[Decision]:::sub
+    end
+    p1-->t1-->s1
+    p2-->t2-->s2
+    p3-->t3-->s3
+    p4-->t4==>s4
+    p5-->t5-->s5
+    p6-->t6-.->s6
+    p7-->t7-->s7
+    p8-->t8-->s8
+    p9-->t9-->s9
+    p10-->t10-.->s10
+    p11-->t11-->s11
+    A[["Audit service: subscribes to ALL 11 topics → PostgreSQL → live Monitor"]]:::quiet
+    S ~~~ A

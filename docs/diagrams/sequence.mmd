@@ -1,0 +1,74 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, DejaVu Sans, sans-serif","fontSize":"14px","actorBkg":"#1f3a5f","actorTextColor":"#ffffff","actorBorder":"#1f3a5f","actorLineColor":"#9aa7b6","signalColor":"#2b2b2b","signalTextColor":"#1d1d1d","noteBkgColor":"#fff6d6","noteBorderColor":"#d9b44a","sequenceNumberColor":"#ffffff"},"sequence":{"mirrorActors":true,"messageMargin":28,"boxMargin":8,"noteMargin":10,"actorMargin":30,"wrap":true,"width":185}}}%%
+sequenceDiagram
+    title Fraud Agents: how one payment flows through the system (event by event)
+    autonumber
+    participant R as Replayer<br/>(payment source)
+    participant G as Gateway<br/>(FastAPI)
+    participant B as Redis Streams<br/>message bus
+    participant RS as Risk Scoring<br/>(XGBoost)
+    participant D as Decision<br/>(rules)
+    participant I as Investigation<br/>(LangGraph + Llama)
+    participant V as Verification<br/>(LangGraph +<br/>PostgreSQL)
+    participant S as SMS provider<br/>+ customer (mock)
+    participant N as Notification<br/>(LangGraph + Llama)
+    participant A as Analyst<br/>(Streamlit Monitor)
+
+    rect rgb(232, 241, 252)
+    Note over R,B: ① A payment arrives
+    R->>G: POST /webhooks/payments (HMAC-signed)
+    Note over G: Check signature · card number → token · refuse the answer key
+    G->>B: XADD → events:transaction.received
+    G-->>R: 202 Accepted
+    end
+
+    rect rgb(234, 247, 236)
+    Note over B,D: ② Score and decide (every payment)
+    B->>RS: transaction.received
+    RS->>B: risk.scored (score 0–1 + top SHAP reasons)
+    B->>D: risk.scored
+    D->>B: transaction.decided: approve (< 0.50) · flag (≥ 0.50) · hold (≥ 0.90)
+    Note over D: approve → finished here
+    end
+
+    rect rgb(253, 240, 230)
+    Note over B,I: ③ Investigate (flag or hold only)
+    B->>I: transaction.decided
+    Note over I: Llama calls 3 tools (card recent activity, card spending profile, shop type risk) → report → rule checks
+    I->>B: investigation.completed: verify_with_customer · escalate_to_analyst
+    Note over I: The AI alone never releases a payment
+    end
+
+    rect rgb(243, 236, 252)
+    Note over B,S: ④ Ask the customer
+    B->>V: investigation.completed
+    V->>B: verification.requested
+    V->>S: POST /messages "Was this you?" (API key + Idempotency-Key)
+    Note over V: interrupt() → paused, state saved in PostgreSQL
+    S->>G: POST /webhooks/sms-replies (HMAC-signed reply)
+    G->>B: customer.replied
+    B->>V: customer.replied
+    Note over V: Resume → plain rules read the reply (AI only if unclear)
+    V->>B: verification.completed: confirmed · denied · unclear · no_reply (60 s)
+    end
+
+    rect rgb(234, 247, 236)
+    Note over B,N: ⑤ Final outcome and customer text
+    B->>D: verification.completed (or escalate_to_analyst)
+    Note over D: One final outcome per payment (first one wins)
+    D->>B: transaction.resolved: released · blocked · sent_to_analyst
+    B->>N: transaction.resolved
+    Note over N: Llama drafts text → rules check it → safe template if it fails
+    N->>S: POST /messages (outcome text)
+    N->>B: notification.sent
+    end
+
+    rect rgb(252, 234, 236)
+    Note over B,A: ⑥ Human analyst (sent_to_analyst only)
+    Note over A: Case shows on the Analyst page
+    A->>B: case.reviewed: release · block
+    B->>D: case.reviewed
+    D->>B: transaction.resolved (replaces sent_to_analyst)
+    B->>N: transaction.resolved → customer text as in ⑤
+    end
+
+    Note over R,A: Every event on every stream is also saved by the Audit service to PostgreSQL, which feeds the live Monitor. An event that fails 3 times goes to events:dead, and its case goes to the analyst.

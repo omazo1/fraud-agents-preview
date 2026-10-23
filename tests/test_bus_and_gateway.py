@@ -48,6 +48,29 @@ def test_two_groups_each_get_every_event(redis_client, stream):
     assert a == b == [event]
 
 
+# Why Redis Streams and not Redis's own "Pub/Sub" feature: a Pub/Sub message is lost if no
+# subscriber is listening at that moment. A stream keeps it until each subscriber has it.
+def test_a_subscriber_that_was_down_still_gets_the_events_it_missed(redis_client, stream):
+    bus.ensure_group(redis_client, stream, "late")         # subscribed earlier, then stopped
+    events = [decided() for _ in range(3)]
+    for event in events:                                   # published while nobody was reading
+        redis_client.xadd(stream, {"event": event.model_dump_json()})
+    seen = []
+    bus._one_round(redis_client, stream, "late", seen.append, "c1", 100, None)   # back up
+    assert seen == events
+
+
+def test_an_event_a_crashed_subscriber_never_finished_is_delivered_again(redis_client, stream):
+    event = decided()
+    redis_client.xadd(stream, {"event": event.model_dump_json()})
+    bus.ensure_group(redis_client, stream, "g")
+    redis_client.xreadgroup("g", "crashed", {stream: ">"}, count=1)   # read it, crashed before XACK
+    seen = []
+    bus._one_round(redis_client, stream, "g", seen.append, "c2", 100, None, 10, 0)   # reclaim now
+    assert seen == [event]
+    assert redis_client.xpending(stream, "g")["pending"] == 0          # finished this time
+
+
 def test_a_failing_event_is_handed_over_then_set_aside(redis_client, stream):
     event = decided()
     redis_client.xadd(stream, {"event": event.model_dump_json()})

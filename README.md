@@ -2,7 +2,7 @@
 
 A capstone project (Centennial College, COMP385) by **Omair Khan**.
 
-Card payments arrive as signed webhooks and become **events** on a Redis Streams bus. Small, independent **agents** each read the events they care about and publish new ones:
+Card payments arrive as signed webhooks and become **events**. The agents talk to each other only through **Pub/Sub**: each kind of event is a **topic**, every agent **subscribes** to the topics it needs and **publishes** new events, and no agent ever calls another one directly. Small, independent **agents** each read the events they care about and publish new ones:
 
 - an XGBoost model scores every payment;
 - plain rules decide what happens;
@@ -32,6 +32,24 @@ replayer --signed webhook--> gateway --> Risk Scoring (XGBoost) --> Decision (ru
 every event --> audit log (PostgreSQL) --> Fraud System Monitor (Streamlit)
 every AI call --> llm_calls table
 ```
+
+### How Pub/Sub works here
+
+![Topics, publishers and subscribers](docs/images/pubsub_topics.png)
+
+- **Topic = one Redis Stream** (e.g. `events:transaction.resolved`). There are 11 topics, one per event form.
+- **Subscriber = one consumer group.** Every group gets its own copy of every event, so one event can reach several agents. For example, `investigation.completed` goes to both Decision and Verification, and the Audit service subscribes to all 11 topics.
+- **Why Redis Streams and not Redis's own "Pub/Sub" feature.** That feature is *at-most-once*: a message sent while a subscriber is down is lost for good. A stream is a **durable log**:
+  - each group keeps its own place in it;
+  - an event is acknowledged (`XACK`) only after it is handled;
+  - an event a crashed subscriber never finished is delivered again;
+  - an event that keeps failing goes to a dead-letter stream (`events:dead`) and its case goes to an analyst.
+
+  A fraud system can't lose payments. Two tests show the difference: a subscriber that was down still gets what it missed, and a crashed one gets the event again.
+- **Durable Redis.** Events live in Redis before the Audit service copies them into PostgreSQL, so Redis writes every event to disk before confirming it (`appendonly yes` + `appendfsync always` in `compose.yaml`).
+- **Webhooks only at the edges.** Outside parties (the payment source, the SMS provider) use signed webhooks; inside the system it is Pub/Sub only.
+
+The step-by-step flow of one payment, event by event, is in [docs/images/sequence.png](docs/images/sequence.png) (the sources of both diagrams are in `docs/diagrams/`).
 
 | Program | What it does | Technology |
 | --- | --- | --- |
@@ -87,7 +105,7 @@ The trained model is saved in `models/`. To train it again: `python -m fraud_age
 ## Tests
 
 ```bash
-pytest                 # about 160 tests in a few seconds
+pytest                 # about 165 tests in a few seconds
 ```
 
 - The tests need no Llama and no dataset. The bus, gateway and outcome-rule tests need Redis (`docker compose up -d`) and skip themselves without it. They use a separate Redis database (15), so they never touch a running system.
@@ -102,7 +120,7 @@ They cover:
 - what may release a flagged payment;
 - the outcome rules (the first final outcome wins; an analyst can replace only a waiting case; no outdated texts);
 - the model;
-- the bus (duplicates, failures handed to a human);
+- the bus (duplicates, every subscriber gets every event, a subscriber that was down or crashed still gets it, failures handed to a human);
 - the gateway;
 - the SMS provider (one text per key; replies survive a restart).
 
@@ -110,13 +128,14 @@ They cover:
 
 ```
 src/fraud_agents/
-  shared/      events.py (the 11 event forms), bus.py (Redis Streams), db.py, llm.py, signing.py, cards.py, config.py
+  shared/      events.py (the 11 event forms = the 11 topics), bus.py (Pub/Sub on Redis Streams), db.py, llm.py, signing.py, cards.py, config.py
   agents/      risk_scoring/, decision/, investigation/, verification/, notification/
   services/    gateway/, replayer/, audit/, sms/, metrics/ (the run report)
   monitor/     app.py (the Streamlit Monitor)
 models/        the trained XGBoost model and its details
 scripts/       start_all.sh, status.sh, stop_all.sh
 tests/         the automatic tests
+docs/          the Pub/Sub and sequence diagrams (images and Mermaid sources)
 ```
 
 ## Safety choices (and their limits)
@@ -125,7 +144,7 @@ tests/         the automatic tests
   - **No payment is ever released by an AI alone.** A flagged or held payment is released only by the customer's clear "yes" (read by plain rules) or by an analyst.
   - A customer's reply is decided by plain rules only when it is a clean yes or no. When the AI has to read a reply, its "yes" is not enough: a human decides. Its "no" counts only if the reply has no yes-word.
   - When the Investigation agent recommends "no further action", the customer is still asked. Two reviews showed that no word-matching check can make an AI's evidence trustworthy enough to release a payment by itself (e.g. "shopped here 22 times" matched the "22 km" in the facts). The evidence check (every number must appear in a tool result, in a sentence sharing a specific word) is kept as a note in the log. `ALLOW_AI_RELEASE` in `agents/investigation/agent.py` switches the old behaviour back on.
-- **No case is lost.** If an agent keeps failing on a flagged or held payment, the payment goes to the analyst queue before the failed event is set aside.
+- **No case is lost.** Events are kept in durable Redis Streams until every subscriber has handled them (see "How Pub/Sub works here"). If an agent keeps failing on a flagged or held payment, the payment goes to the analyst queue before the failed event is set aside.
 - **No double effects.**
   - Every event has a stable ID, and every reader skips a repeat.
   - Every text carries an idempotency key. The SMS provider records a text, schedules its reply and saves the key in **one Redis transaction**, and keeps pending replies in Redis, so a crash or restart neither repeats nor loses a text.

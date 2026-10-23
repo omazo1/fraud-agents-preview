@@ -2,7 +2,9 @@ services:
   redis:
     image: redis:8.10.2
     container_name: fraud-redis
-    command: ["redis-server", "--appendonly", "yes"]
+    # Durable: every event is written to disk (append-only file) before Redis confirms it,
+    # so a crash or power cut can't lose events that haven't reached PostgreSQL yet.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
     ports:
       - "6379:6379"
     volumes:

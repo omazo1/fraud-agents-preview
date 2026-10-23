@@ -1,7 +1,15 @@
-"""The event bus: publish forms to Redis Streams and read them back safely.
+"""The event bus: Pub/Sub between the agents, built on Redis Streams.
 
-One stream per event type, e.g. "events:transaction.received".
-Every agent reads its input stream as a member of a consumer group, so:
+- Publish: an agent adds an event to its TOPIC. Each topic is one stream per event type,
+  e.g. "events:transaction.received".
+- Subscribe: an agent reads a topic as its own consumer group. Every group gets its own copy
+  of every event, so one event can reach several agents (e.g. the Audit service reads them all).
+
+Why Redis Streams and not Redis's "Pub/Sub" feature: that feature drops a message if the
+subscriber isn't listening at that moment. A stream keeps it (and compose.yaml makes Redis
+write it to disk at once), so a subscriber that was down or crashed still gets it.
+
+Within one group:
 - each event is handled by one copy of the agent;
 - an event is only marked done (XACK) after it has been handled;
 - an event left unfinished by a crash is picked up again later;
