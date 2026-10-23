@@ -11,7 +11,7 @@ Card payments arrive as signed webhooks and become **events** on a Redis Streams
 
 Every event is kept in a PostgreSQL audit log, and a Streamlit Monitor shows it all live.
 
-**The design rule:** *the AI advises, rules decide, and a human can override.* No AI output on its own can release a held payment.
+**The design rule:** *the AI advises, rules decide, and a human can override.* No AI output on its own can release a payment.
 
 ---
 
@@ -87,7 +87,7 @@ The trained model is saved in `models/`. To train it again: `python -m fraud_age
 ## Tests
 
 ```bash
-pytest                 # about 125 tests in a few seconds
+pytest                 # about 160 tests in a few seconds
 ```
 
 - The tests need no Llama and no dataset. The bus, gateway and outcome-rule tests need Redis (`docker compose up -d`) and skip themselves without it. They use a separate Redis database (15), so they never touch a running system.
@@ -103,7 +103,8 @@ They cover:
 - the outcome rules (the first final outcome wins; an analyst can replace only a waiting case; no outdated texts);
 - the model;
 - the bus (duplicates, failures handed to a human);
-- the gateway.
+- the gateway;
+- the SMS provider (one text per key; replies survive a restart).
 
 ## Project layout
 
@@ -121,13 +122,13 @@ tests/         the automatic tests
 ## Safety choices (and their limits)
 
 - **Rules decide, the AI advises.**
-  - A **held** payment is never released by an AI: it needs the customer's clear "yes" (read by plain rules) or an analyst.
+  - **No payment is ever released by an AI alone.** A flagged or held payment is released only by the customer's clear "yes" (read by plain rules) or by an analyst.
   - A customer's reply is decided by plain rules only when it is a clean yes or no. When the AI has to read a reply, its "yes" is not enough: a human decides. Its "no" counts only if the reply has no yes-word.
-  - A **flagged** (lower-risk) payment can be released when the Investigation agent recommends "no further action". That counts only if its verdict is "likely genuine", every piece of evidence states a number, and every number in its report (small rounding allowed) is found in the tool results. Otherwise the customer is asked.
+  - When the Investigation agent recommends "no further action", the customer is still asked. Two reviews showed that no word-matching check can make an AI's evidence trustworthy enough to release a payment by itself (e.g. "shopped here 22 times" matched the "22 km" in the facts). The evidence check (every number must appear in a tool result, in a sentence sharing a specific word) is kept as a note in the log. `ALLOW_AI_RELEASE` in `agents/investigation/agent.py` switches the old behaviour back on.
 - **No case is lost.** If an agent keeps failing on a flagged or held payment, the payment goes to the analyst queue before the failed event is set aside.
 - **No double effects.**
   - Every event has a stable ID, and every reader skips a repeat.
-  - Every text carries an idempotency key.
+  - Every text carries an idempotency key. The SMS provider records a text, schedules its reply and saves the key in **one Redis transaction**, and keeps pending replies in Redis, so a crash or restart neither repeats nor loses a text.
   - Each payment gets one final outcome; an analyst can replace only a "sent to an analyst" one.
 - **Privacy.**
   - Card numbers become keyed tokens at the gateway.
@@ -135,7 +136,8 @@ tests/         the automatic tests
   - The answer key is refused at the gateway.
 - **Known limits.**
   - The model alone catches about two thirds of frauds at the 0.5 line (Part 1 test: 1,427 of 2,145), and it under-scores large online purchases.
-  - The checks catch made-up numbers, not wrong reasoning.
+  - The evidence check catches many made-up or out-of-context numbers, but it matches words, not meaning; that is why it can't release anything.
+  - Customer texts state only what happened to the **payment** (the system doesn't protect, freeze or replace cards). If even a template failed its checks, a neutral "please check your banking app" text is sent instead.
   - Word lists for unsafe texts are never complete; the fixed template is the safety net.
   - A local 8B model handles one investigation at a time, so the AI checks queue up under load.
 

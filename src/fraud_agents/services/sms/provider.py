@@ -14,9 +14,15 @@ It plays two outside parties, so the bank side can be tested end to end:
 
 Every text in and out is kept in the Redis stream "sms:log" for the System Monitor.
 
-Idempotency (Part 3 · Step 3): the bank may send an "Idempotency-Key" header. A second
-request with the same key is not sent again: it gets the first request's message_id.
-So a bank agent that crashed after sending, and retries, never texts the customer twice.
+Idempotency (Part 3 · Steps 3 and 6): the bank may send an "Idempotency-Key" header. A
+second request with the same key is not sent again: it gets the first request's message_id.
+Sending is ONE Redis transaction (record the text + schedule the customer's reply + save the
+key): all of it happens or none of it does, so a crash can never leave a key without a text
+(a retry would wrongly say "duplicate") or a text without a key.
+
+Crash-safe replies (Part 3 · Step 6): a reply the customer will send is kept in Redis
+("sms:pending_replies", by due time), not only in memory. A delivery loop answers the due
+ones; anything half-done when the provider stopped is picked up again when it restarts.
 
 Run from the project folder:
     uvicorn fraud_agents.services.sms.provider:app --port 8100
@@ -42,6 +48,14 @@ from fraud_agents.shared import config, signing
 log = logging.getLogger("sms-provider")
 
 SMS_LOG = "sms:log"
+PENDING_REPLIES = "sms:pending_replies"   # sorted set: a reply to send -> when it is due
+REPLYING = "sms:replying"                 # hash: replies being answered right now
+RETRY_REPLY_AFTER = 30                    # seconds: when the bank couldn't be reached, try again
+# Atomic "claim": remove from the waiting set and mark as being answered, or do nothing.
+CLAIM = ("if redis.call('zrem', KEYS[1], ARGV[1]) == 1 then "
+         "redis.call('hset', KEYS[2], ARGV[1], ARGV[2]) return 1 end return 0")
+IDEMPOTENCY_DAYS = 7
+REPLIES_LOGGED = "sms:replies_logged"     # reply IDs already written to sms:log
 GATEWAY_REPLY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8000") + "/webhooks/sms-replies"
 TEST_FILE = "data/raw/fraudTest.csv"
 
@@ -61,6 +75,7 @@ class OutgoingText(BaseModel):
     reference: str | None = None           # the bank's reference (verification.requested event_id)
     txn_id: str | None = None              # which payment the text is about
     expects_reply: bool = False            # True for "was this you?" questions
+    message_id: str | None = None          # filled in by the provider when it sends the text
 
     @model_validator(mode="after")
     def reply_needs_reference(self):
@@ -82,8 +97,15 @@ async def lifespan(app: FastAPI):
     app.state.is_fraud = dict(zip(df["trans_num"], df["is_fraud"]))
     app.state.http = httpx.AsyncClient(timeout=10)
     app.state.tasks = set()
-    log.info("SMS provider ready: POST /messages (customers know %d payments)", len(app.state.is_fraud))
+    # Replies that were being answered when the provider last stopped: answer them again.
+    for item in await app.state.redis.hkeys(REPLYING):
+        await app.state.redis.zadd(PENDING_REPLIES, {item: time.time()})
+        await app.state.redis.hdel(REPLYING, item)
+    loop = asyncio.create_task(deliver_due_replies(app.state))
+    log.info("SMS provider ready: POST /messages (customers know %d payments; %d replies waiting)",
+             len(app.state.is_fraud), await app.state.redis.zcard(PENDING_REPLIES))
     yield
+    loop.cancel()
     await app.state.http.aclose()
     await app.state.redis.aclose()
 
@@ -91,15 +113,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Mock SMS provider", lifespan=lifespan)
 
 
+def log_entry(direction: str, who: str, text: str, message_id: str, txn_id: str | None) -> dict:
+    return {"direction": direction, "who": who, "text": text, "message_id": message_id,
+            "txn_id": txn_id or "", "at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
+
+
 async def record(r, direction: str, who: str, text: str, message_id: str, txn_id: str | None):
-    await r.xadd(SMS_LOG, {"direction": direction, "who": who, "text": text,
-                           "message_id": message_id, "txn_id": txn_id or "",
-                           "at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())},
-                 maxlen=5000, approximate=True)
+    await r.xadd(SMS_LOG, log_entry(direction, who, text, message_id, txn_id), maxlen=5000, approximate=True)
 
 
-async def send_reply_webhook(state, reply: dict) -> None:
-    """Deliver a customer's reply to the bank, signed, retrying a few times."""
+async def send_reply_webhook(state, reply: dict) -> bool:
+    """Deliver a customer's reply to the bank, signed, retrying a few times.
+    True = delivered (or refused for good by the bank); False = the bank couldn't be reached."""
     body = json.dumps(reply).encode()
     for attempt in range(1, 6):
         ts = str(int(time.time()))
@@ -109,41 +134,71 @@ async def send_reply_webhook(state, reply: dict) -> None:
             response = await state.http.post(GATEWAY_REPLY_URL, content=body, headers=headers)
             if 200 <= response.status_code < 300:
                 log.info("Reply %s delivered to the bank: HTTP %s", reply["message_id"], response.status_code)
-                return
+                return True
             if response.status_code < 500:   # the bank refused it: retrying won't help
                 log.error("Bank refused reply %s: HTTP %s %s", reply["message_id"],
                           response.status_code, response.text[:200])
-                return
+                return True
         except httpx.TransportError:
             pass
         await asyncio.sleep(2 ** attempt)
-    log.warning("Could not deliver reply %s to the bank", reply["message_id"])
+    log.warning("Could not deliver reply %s to the bank: will try again in %d s",
+                reply["message_id"], RETRY_REPLY_AFTER)
+    return False
 
 
-async def customer_answers(state, msg: OutgoingText, message_id: str) -> None:
+async def deliver_due_replies(state) -> None:
+    """Every half second: answer the replies that are due. Runs for as long as the provider."""
+    while True:
+        try:
+            for item in await state.redis.zrangebyscore(PENDING_REPLIES, 0, time.time(), start=0, num=20):
+                # Move it from "waiting" to "being answered" in ONE step, so a crash can't lose it.
+                if await state.redis.eval(CLAIM, 2, PENDING_REPLIES, REPLYING, item, time.time()):
+                    task = asyncio.create_task(customer_answers(state, item))
+                    state.tasks.add(task)               # keep a reference until it finishes
+                    task.add_done_callback(state.tasks.discard)
+        except Exception:
+            log.exception("Could not read the waiting replies; trying again")
+        await asyncio.sleep(0.5)
+
+
+async def customer_answers(state, item: str) -> None:
     """The simulated customer reads the text and (maybe) answers. Errors are logged, not lost."""
     try:
-        await _customer_answers(state, msg, message_id)
+        done = await _customer_answers(state, OutgoingText.model_validate_json(item))
+    except asyncio.CancelledError:
+        raise   # the provider is stopping: leave it in REPLYING, so it is answered after a restart
     except Exception:
-        log.exception("Simulated customer failed on %s", message_id)
+        log.exception("Simulated customer failed on %s", item[:120])
+        done = True
+    async with state.redis.pipeline(transaction=True) as pipe:
+        if not done:   # the bank was unreachable: put it back to wait, don't drop it
+            pipe.zadd(PENDING_REPLIES, {item: time.time() + RETRY_REPLY_AFTER})
+        pipe.hdel(REPLYING, item)
+        await pipe.execute()
 
 
-async def _customer_answers(state, msg: OutgoingText, message_id: str) -> None:
-    await asyncio.sleep(random.uniform(*REPLY_DELAY_SECONDS))
+async def _customer_answers(state, msg: OutgoingText) -> bool:
+    """Returns False only if the bank couldn't be reached (then the reply is tried again)."""
+    message_id = msg.message_id
     truth = state.is_fraud.get(msg.txn_id)
-    roll = random.randint(1, 100)
+    dice = random.Random(message_id)           # the same text always gets the same answer, even on a retry
+    roll = dice.randint(1, 100)
     if roll <= NO_REPLY_PERCENT:
         log.info("Customer %s did not reply to %s", msg.to, message_id)
-        return
+        return True
     if truth is None or roll <= NO_REPLY_PERCENT + UNCLEAR_PERCENT:
-        answer = random.choice(UNCLEAR)        # unknown payment: a real customer would be confused
+        answer = dice.choice(UNCLEAR)          # unknown payment: a real customer would be confused
     elif truth == 1:
-        answer = random.choice(SAYS_NO)        # it really was fraud: "not me"
+        answer = dice.choice(SAYS_NO)          # it really was fraud: "not me"
     else:
-        answer = random.choice(SAYS_YES)       # they really made it: "yes, me"
-    reply_id = "sms-in-" + uuid.uuid4().hex[:12]
-    await record(state.redis, "in", msg.to, answer, reply_id, msg.txn_id)
-    await send_reply_webhook(state, {
+        answer = dice.choice(SAYS_YES)         # they really made it: "yes, me"
+    reply_id = "sms-in-" + message_id.removeprefix("sms-out-")   # one reply per text, even if retried
+    if not await state.redis.sismember(REPLIES_LOGGED, reply_id):   # log each reply once, even if retried
+        await record(state.redis, "in", msg.to, answer, reply_id, msg.txn_id)
+        await state.redis.sadd(REPLIES_LOGGED, reply_id)
+        await state.redis.expire(REPLIES_LOGGED, IDEMPOTENCY_DAYS * 24 * 3600)   # doesn't grow forever
+    return await send_reply_webhook(state, {
         "message_id": reply_id, "from": msg.to, "text": answer,
         "in_reply_to": message_id, "reference": msg.reference, "txn_id": msg.txn_id,
     })
@@ -156,24 +211,30 @@ async def send_text(msg: OutgoingText, x_api_key: str | None = Header(default=No
     if x_api_key != app.state.api_key:
         raise HTTPException(status_code=401, detail="bad API key")
     message_id = "sms-out-" + uuid.uuid4().hex[:12]
-    if idempotency_key:
-        first = await app.state.redis.set(f"sms:idem:{idempotency_key}", message_id, nx=True,
-                                          ex=7 * 24 * 3600)
-        if not first:   # already sent for this key: don't text the customer again
-            earlier = await app.state.redis.get(f"sms:idem:{idempotency_key}")
-            log.info("Repeat of %s (same Idempotency-Key): not sent again", earlier)
-            return {"status": "duplicate", "message_id": earlier}
+    sent = msg.model_copy(update={"message_id": message_id})
+    key = f"sms:idem:{idempotency_key}" if idempotency_key else None
     try:
-        await record(app.state.redis, "out", msg.to, msg.text, message_id, msg.txn_id)
-    except Exception:
-        if idempotency_key:   # nothing was sent: free the key so the bank's retry goes through
-            await app.state.redis.delete(f"sms:idem:{idempotency_key}")
-        raise
+        async with app.state.redis.pipeline(transaction=True) as pipe:
+            if key:
+                await pipe.watch(key)
+                earlier = await pipe.get(key)
+                if earlier:   # already sent for this key: don't text the customer again
+                    await pipe.unwatch()
+                    log.info("Repeat of %s (same Idempotency-Key): not sent again", earlier)
+                    return {"status": "duplicate", "message_id": earlier}
+            # ONE transaction: the text, its scheduled reply and the key all happen, or none do.
+            pipe.multi()
+            pipe.xadd(SMS_LOG, log_entry("out", msg.to, msg.text, message_id, msg.txn_id),
+                      maxlen=5000, approximate=True)
+            if msg.expects_reply:
+                pipe.zadd(PENDING_REPLIES, {sent.model_dump_json(): time.time()
+                                            + random.uniform(*REPLY_DELAY_SECONDS)})
+            if key:
+                pipe.set(key, message_id, ex=IDEMPOTENCY_DAYS * 24 * 3600)
+            await pipe.execute()
+    except aioredis.WatchError:   # the same key is being sent right now by another request
+        raise HTTPException(status_code=409, detail="the same text is being sent; retry shortly")
     log.info("Text %s to %s: %s", message_id, msg.to, msg.text[:80])
-    if msg.expects_reply:
-        task = asyncio.create_task(customer_answers(app.state, msg, message_id))
-        app.state.tasks.add(task)               # keep a reference until it finishes
-        task.add_done_callback(app.state.tasks.discard)
     return {"status": "queued", "message_id": message_id}
 
 

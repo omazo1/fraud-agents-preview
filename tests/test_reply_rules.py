@@ -18,6 +18,7 @@ from fraud_agents.agents.verification.agent import YES_SIGNAL, keyword_label
     ("No problem, yes that was me", "unknown"), ("no, it was me", "unknown"),
     ("Yes I did not make it", "unknown"), ("call me later", "unknown"),
     ("Yes ❌", "unknown"), ("yes 👎", "unknown"), ("Yes नहीं", "unknown"),
+    ("yes 0", "unknown"), ("YES that was me 123", "unknown"),          # digits: not a clean answer
 ])
 def test_keyword_label(reply, label):
     assert keyword_label(reply) == label

@@ -142,8 +142,8 @@ def keyword_label(text: str) -> str:
     t = text.strip().lower().replace("’", "'")
     if t.endswith("?"):
         return "question"
-    if re.search(r"[^a-z0-9 .,!'\-]", t):
-        return "unknown"      # emoji, other scripts or symbols ("Yes ❌", "Yes नहीं"): not a clean answer
+    if re.search(r"[^a-z .,!'\-]", t):
+        return "unknown"      # digits, emoji, other scripts or symbols ("yes 0", "Yes ❌"): not a clean answer
     t = re.sub(r"[^a-z ]+", " ", t.replace("'", ""))   # "wasn't" -> "wasnt"; drop punctuation
     t = " ".join(w for i, w in enumerate(t.split()) if i == 0 or w != t.split()[i - 1])  # "no no" -> "no"
     if CLEAN_YES.match(t):

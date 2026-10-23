@@ -79,8 +79,11 @@ def test_a_replaced_outcome_is_not_texted(redis_client):
 
 # ---------- the investigation guard, end to end ----------
 
-TOOLS = [HumanMessage("Investigate payment abc.\nFacts: {'amount': 318.72, 'score': 0.62}"),
-         ToolMessage(content="{'largest_before': 425.10, 'fraud_rate': 0.0141}", tool_call_id="1")]
+TOOLS = [HumanMessage("Investigate payment abc.\nFacts: Payment abc: $318.72 at Kiehn Inc (shop type grocery_pos). "
+                      "Fraud model score: 0.62 (factors that raised it: amount)."),
+         ToolMessage(content="Card card-f3f1a40f013b7f4f made 412 payments in the previous 180 days. Typical amount "
+                             "$44.72 (95% of payments were at or below $425.10). In past records, 1.41% of payments "
+                             "in shop type grocery_pos were fraud.", tool_call_id="1")]
 
 
 def report(summary, evidence):

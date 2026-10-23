@@ -275,50 +275,102 @@ NUMBER = re.compile(r"(?<![\w.])\$?(\d[\d,]*(?:\.\d+)?)(%?)")
 LONG_ID = re.compile(r"\b(?:card-)?[0-9a-f]{16,}\b")   # txn and card IDs are not facts to check
 
 
-def tool_numbers(messages) -> list[float]:
-    """Every number the tools (and the payment's facts) gave the AI."""
+TOKEN = re.compile(r"\$?(\d[\d,]*(?:\.\d+)?)(%?)|([a-z]+)")
+# Words too common to show that two numbers mean the same thing.
+GENERIC = {"the", "a", "an", "of", "in", "at", "to", "and", "or", "for", "this", "that", "these", "was",
+           "were", "is", "are", "be", "been", "with", "its", "it", "on", "by", "from", "has", "had",
+           "have", "than", "per", "about", "card", "cards", "payment", "payments", "made", "make", "its",
+           "there", "their", "times", "time", "only", "all", "some", "other", "before", "after",
+           "shop", "shops", "type", "types"}
+ANY_CONTEXT = {"*"}   # marks a number that needs no shared word
+SENTENCE_END = re.compile(r"(?<=[.;!?])\s+|\n+")   # a decimal point has no space after it
+DATES_AND_TIMES = re.compile(r"\d{4}-\d{2}-\d{2}(?:[ t]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:[+-]\d{2}:\d{2})?)?"
+                             r"|\b\d{1,2}:\d{2}(?::\d{2})?\b")   # their digits are not facts to match
+
+
+def numbers_in_context(text: str) -> list[tuple[str, str, set[str]]]:
+    """Each number in a text, with the words of its sentence: (number, "%" or "", words).
+    The tools and the report both state one fact per sentence."""
+    found = []
+    for sentence in SENTENCE_END.split(DATES_AND_TIMES.sub(" ", LONG_ID.sub(" ", text.lower()))):
+        tokens = [m.groups() for m in TOKEN.finditer(sentence)]
+        words = {w[:5] for _, _, w in tokens if w and len(w) > 1}
+        found += [(number, percent, words) for number, percent, _ in tokens if number]
+    return found
+
+
+def tool_numbers(messages) -> list[tuple[float, set[str]]]:
+    """Every number the tools (and the payment's facts) gave the AI, with its nearby words.
+    The AI's own messages are not a source."""
     texts = [str(m.content) for m in messages
              if isinstance(m, ToolMessage) or (isinstance(m, HumanMessage) and "Facts:" in str(m.content))]
-    found = NUMBER.findall(LONG_ID.sub(" ", " ".join(texts)))
-    return [float(n.replace(",", "")) for n, _ in found]
+    out = []
+    # The payment's own amount is the case itself, not a claim: it counts in any sentence.
+    for raw in re.findall(r"Facts: Payment \S+: \$([\d,]+\.\d+)", "\n".join(texts)):
+        out.append((float(raw.replace(",", "")), ANY_CONTEXT))
+    for raw, percent, near in numbers_in_context("\n".join(texts)):   # one tool result never runs into the next
+        value = float(raw.replace(",", ""))
+        out.append((value, near))
+        if not percent:
+            out.append((value * 100, near))   # 0.0141 in a tool result can be written 1.41%
+    return out
 
 
 def ungrounded_numbers(report: dict, messages) -> list[str]:
-    """Numbers in the report that no tool gave (allowing rounding, and 0.0141 = 1.41%)."""
+    """Numbers in the report that no tool gave IN A SIMILAR CONTEXT (Part 3 · Step 6).
+
+    A number counts only if a tool gave the same number (small rounding allowed) in a
+    sentence sharing at least one specific word with the report's sentence (not a generic
+    one like "card", "payment" or "shop"), so "24 verified purchases" doesn't match "in the 24 hours before" and
+    "412 trips abroad" doesn't match "made 412 payments". This matches words, not meaning:
+    it makes made-up claims harder to slip through, but it can't prove them true."""
     source = tool_numbers(messages)
-    text = LONG_ID.sub(" ", " ".join([report["summary"], *report["evidence"]]))
     missing = []
-    for raw, percent in NUMBER.findall(text):
+    for raw, percent, near in numbers_in_context("\n".join([report["summary"], *report["evidence"]])):
         value = float(raw.replace(",", ""))
         places = len(raw.split(".")[1]) if "." in raw else 0
-        candidates = source + ([s * 100 for s in source] if percent else [])
-        if places == 0:   # a whole number may round only a number of at least 1 ("1" is not 0.62)
-            candidates = [c for c in candidates if c >= 1 or c == value]
-        if not any(abs(round(c, places) - value) < 1e-9 for c in candidates):
+        def same_number(c: float) -> bool:
+            if places == 0 and c < 1 and c != value:
+                return False   # a whole number may round only a number of at least 1 ("1" is not 0.62)
+            return abs(round(c, places) - value) < 1e-9
+        def same_context(words: set[str]) -> bool:
+            return words is ANY_CONTEXT or bool((near & words) - {g[:5] for g in GENERIC})
+        if not any(same_number(c) and same_context(words) for c, words in source):
             missing.append(raw + percent)
     return missing
 
 
+ALLOW_AI_RELEASE = False   # Part 3 · Step 6: the AI alone never releases a payment (see guard_action)
+
+
+def evidence_notes(report: dict, messages) -> list[str]:
+    """What the plain checks found wrong with the AI's evidence (empty = nothing found).
+    Word matching, not meaning: a clean result does NOT prove the report true."""
+    notes = []
+    wordy = [e for e in report["evidence"] if not NUMBER.search(LONG_ID.sub(" ", e))]
+    if wordy:
+        notes.append("evidence without a checkable number: " + "; ".join(wordy)[:200])
+    missing = ungrounded_numbers(report, messages)
+    if missing:
+        notes.append("numbers not found in the tool results: " + ", ".join(missing[:5]))
+    return notes
+
+
 def guard_action(report: dict, messages) -> tuple[str, str | None]:
-    """'no_further_action' releases a flagged payment without asking anyone, so the AI may
-    choose it only with a likely_genuine verdict, every piece of evidence stating a number,
-    and every number in its report traced to the tools. Otherwise the customer is asked
-    instead (Part 3 · Step 3). This can't prove the AI's reasoning right; it only stops
-    unchecked claims from releasing a payment on their own."""
+    """'no_further_action' would release a flagged payment without asking anyone. A second
+    review showed that no word-matching check can make an AI's evidence trustworthy enough
+    for that (e.g. "shopped here 22 times" matched the 22 km in the facts). So the AI alone
+    never releases a payment: its "no further action" becomes "ask the customer", and the
+    evidence check is kept only as a note for the log. (ALLOW_AI_RELEASE switches back to
+    the Step 3 behaviour: release only with likely_genuine and no notes.)"""
     action = report["recommended_action"]
     if action != "no_further_action":
         return action, None
-    if report["verdict"] != "likely_genuine":
-        return "verify_with_customer", f"verdict {report['verdict']}"
-    # Every piece of evidence must be a checkable number from the tools; facts in words only
-    # ("shopped here weekly for years") can't be checked, so they can't release a payment.
-    wordy = [e for e in report["evidence"] if not NUMBER.search(LONG_ID.sub(" ", e))]
-    if wordy:
-        return "verify_with_customer", "evidence without a checkable number: " + "; ".join(wordy)[:200]
-    missing = ungrounded_numbers(report, messages)
-    if missing:
-        return "verify_with_customer", "numbers not found in the tool results: " + ", ".join(missing[:5])
-    return action, None
+    notes = ([f"verdict {report['verdict']}"] if report["verdict"] != "likely_genuine" else []) + \
+        evidence_notes(report, messages)
+    if ALLOW_AI_RELEASE and not notes:
+        return action, None
+    return "verify_with_customer", "; ".join(["the AI alone never releases a payment"] + notes)
 
 
 def to_event(decided: TransactionDecided, result: dict, model: str):

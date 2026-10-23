@@ -50,21 +50,21 @@ log = logging.getLogger(PRODUCER)
 # What each outcome means for the customer, and the word the text must contain.
 # The key is the resolution, or "resolution/rule_id" where the reason changes the wording.
 OUTCOMES = {
-    "blocked": ("we blocked the payment and protected your card, because you told us it was not you",
+    "blocked": ("we blocked the payment, because you told us it was not you",
                 "blocked"),
     "released/customer_confirmed": ("the payment is approved, because you confirmed you made it",
                                     "approved"),
     "released": ("we checked the payment, it looks normal, and it is approved", "approved"),
     "sent_to_analyst": ("a member of our fraud team is reviewing the payment and will contact you",
                         "review"),
-    "blocked/analyst_blocked": ("our fraud team reviewed the payment and blocked it to protect your card",
+    "blocked/analyst_blocked": ("our fraud team reviewed the payment and blocked it",
                                 "blocked"),
     "released/analyst_released": ("our fraud team reviewed the payment and it is approved", "approved"),
 }
 
 TEMPLATES = {
     "blocked": "Bank: we blocked the ${amount} payment at {merchant} because you told us it "
-               "wasn't you. Your card is now protected.",
+               "wasn't you.",
     "released/customer_confirmed": "Bank: thanks for confirming. The ${amount} payment at "
                                    "{merchant} is approved.",
     "released": "Bank: we checked the ${amount} payment at {merchant}. It is approved, and you "
@@ -72,10 +72,24 @@ TEMPLATES = {
     "sent_to_analyst": "Bank: our fraud team is reviewing the ${amount} payment at {merchant} "
                        "and will contact you soon.",
     "blocked/analyst_blocked": "Bank: our fraud team reviewed the ${amount} payment at {merchant} "
-                               "and blocked it. Your card is now protected.",
+                               "and blocked it.",
     "released/analyst_released": "Bank: our fraud team reviewed the ${amount} payment at {merchant}. "
                                  "It is approved, and you don't need to do anything.",
 }
+
+# The last resort if even a template failed its checks: says nothing it can't stand behind.
+NEUTRAL_TEXT = "Bank: there is an update on a recent card payment. Please check your banking app."
+
+# The system blocks or approves a PAYMENT; it doesn't do anything else to a card or account,
+# so a text must not claim it did (Part 3 · Step 6).
+# ("blocked" isn't in this list: "your card payment was blocked" is about the payment.)
+_DONE_TO_CARD = r"(protected|safe|secured?|frozen|froze|freez\w*|locked|replac\w*|cancell?ed|deactivat\w*)"
+OVERCLAIM = re.compile(
+    rf"\b(card|account)\b[^.]{{0,25}}\b(is|has been|was|are|have been)\b[^.]{{0,25}}\b{_DONE_TO_CARD}\b"
+    rf"|\b{_DONE_TO_CARD}\b[^.]{{0,15}}\b(your|the) (card|account)\b"
+    r"|(?<!no )\b(new|replacement) card\b|\breplacement\b[^.]{0,20}\bon its way\b"
+    r"|\b(blocked|stopped|suspended) (your|the) (card|account)\b(?!\s+payments?)"
+    r"|\b(card|account)\b[^.]{0,25}\b(suspended|won'?t work)\b", re.IGNORECASE)
 
 FORBIDDEN = re.compile(r"(https?://|www\.|\b[a-z0-9-]+\.(com|ca|net|org|io|co|info)\b|\bp\.?\s?i\.?\s?n\b|"
                        r"password|card number|\bcvv2?\b|\bcvc\b|click)", re.IGNORECASE)
@@ -159,6 +173,8 @@ def check(text: str, resolution: str, amount: str, merchant: str) -> list[str]:
         problems.append("never ask for or mention personal or security details, codes or phone numbers")
     if CONTRADICTS[word].search(rest):
         problems.append(f"must not contradict '{word}' (e.g. say both blocked and approved)")
+    if OVERCLAIM.search(rest):
+        problems.append("must not claim anything was done to the card or account (only the payment)")
     return problems
 
 
@@ -185,7 +201,9 @@ def build_graph(model=None):
     def use_template(state: State) -> dict:
         text = template_text(state["resolution"], state["amount"], state["merchant"])
         if problems := check(text, state["resolution"], state["amount"], state["merchant"]):
-            log.warning("the safe template itself fails a rule (%s); sent anyway", "; ".join(problems))
+            # Never send a text that fails its checks: send the neutral one instead.
+            log.error("the template fails a rule (%s); the neutral text is sent instead", "; ".join(problems))
+            text = NEUTRAL_TEXT
         return {"message": text, "used_template": True}
 
     def accept_draft(state: State) -> dict:

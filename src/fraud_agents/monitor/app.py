@@ -372,13 +372,21 @@ def open_cases(conn, r) -> list[dict]:
         "                  AND f.body->'payload'->>'based_on_event_id' = v.event_id) "
         "ORDER BY o.published_at"
     ).fetchall()
-    return [
-        {"case_id": c, "txn_id": t, "sent_at": at, "rule_id": rule,
-         "amount": amount, "merchant": (merchant or "?").removeprefix("fraud_"),
-         "pending": None if v_dec is None else {"decision": v_dec, "analyst": v_who, "at": v_at}}
-        for c, t, at, rule, amount, merchant, v_dec, v_who, v_at in rows
-        if not r.exists(REVIEW_LOCK.format(case_id=c))   # just reviewed: give it a moment to apply
-    ]
+    cases = []
+    for c, t, at, rule, amount, merchant, v_dec, v_who, v_at in rows:
+        pending = None if v_dec is None else {"decision": v_dec, "analyst": v_who, "at": v_at}
+        just_sent = r.get(REVIEW_LOCK.format(case_id=c))   # a click the audit log may not show yet
+        if pending is None and just_sent:
+            try:
+                seen = json.loads(just_sent)
+                pending = seen | {"at": datetime.fromisoformat(seen["at"])}
+            except (ValueError, KeyError, TypeError):   # a lock written by an older version: just the decision
+                pending = {"decision": just_sent, "analyst": "an analyst", "at": now_utc()}
+        # The case stays in the queue (Part 3 · Step 6: it is no longer hidden after a click),
+        # marked as pending until the Decision agent has applied the review.
+        cases.append({"case_id": c, "txn_id": t, "sent_at": at, "rule_id": rule, "amount": amount,
+                      "merchant": (merchant or "?").removeprefix("fraud_"), "pending": pending})
+    return cases
 
 
 def case_events(conn, txn_id: str) -> list[dict]:
@@ -453,7 +461,8 @@ def submit_review(case: dict, decision: str, analyst: str, note: str, occurred_a
         occurred_at=datetime.fromisoformat(occurred_at),
         payload=CaseReviewedPayload(decision=decision, analyst=analyst.strip() or "analyst",
                                     note=note.strip() or None, based_on_event_id=case["case_id"]))
-    if not r.set(lock, decision, nx=True, ex=LOCK_SECONDS):
+    seen = json.dumps({"decision": decision, "analyst": review.payload.analyst, "at": now_utc().isoformat()})
+    if not r.set(lock, seen, nx=True, ex=LOCK_SECONDS):
         return "already"
     try:
         bus.publish(r, review)
@@ -506,10 +515,14 @@ def analyst_page() -> None:
             events = case_events(conn, case["txn_id"])
             if case["pending"]:
                 p = case["pending"]
-                st.warning(f"A **{p['decision'].upper()}** by {p['analyst']} was sent at {p['at']:%H:%M:%S} UTC, "
-                           "but the Decision agent hasn't applied it yet. Is the Decision agent running? "
-                           "(See data/logs/decision.log.) You can send the same decision again; "
-                           "a different one would conflict with the audit log.")
+                if (now_utc() - p["at"]).total_seconds() < LOCK_SECONDS:
+                    st.info(f"⏳ A **{p['decision'].upper()}** by {p['analyst']} was sent at {p['at']:%H:%M:%S} UTC "
+                            "and is being applied. Click 🔄 Refresh in a few seconds.")
+                else:
+                    st.warning(f"A **{p['decision'].upper()}** by {p['analyst']} was sent at {p['at']:%H:%M:%S} UTC, "
+                               "but the Decision agent hasn't applied it yet. Is the Decision agent running? "
+                               "(See data/logs/decision.log.) You can send the same decision again; "
+                               "a different one would conflict with the audit log.")
             show_case(case, events)
 
             st.markdown("##### Your decision")
@@ -686,6 +699,10 @@ def caught_page() -> None:
     st.title("Caught payments")
     st.caption("Every payment in the audit log, checked against the dataset's answer key (is_fraud). "
                "The answer key is shown here for testing only: the agents never see it.")
+    st.warning("**A live testing view, not the overall performance.** To keep the analyst unbiased, "
+               "payments waiting for an analyst are left out of the numbers below, so they cover a "
+               "changing subset. The official numbers for a run come from the run report "
+               "(`python -m fraud_agents.services.metrics.report`), which counts every payment.")
     key = answer_key()
     if key is None:
         st.error(f"Answer key not found at {ANSWER_KEY_FILE}.")
@@ -723,6 +740,9 @@ def caught_page() -> None:
     df["answer key"] = [truth(key, t) for t in df["txn_id"]]
     df["txn"] = df["txn_id"].str[:8]
     df.loc[df["final outcome"] == "sent_to_analyst", "answer key"] = "hidden"   # don't sway the analyst
+    hidden = int((df["answer key"] == "hidden").sum())
+    if hidden:
+        st.info(f"{hidden} payment(s) waiting for an analyst are left out of the numbers below.")
     decided = df[df["first decision"].notna() & df["answer key"].isin(["FRAUD", "genuine"])]
     stopped = decided["first decision"].isin(["flag", "hold"])
     fraud = decided["answer key"] == "FRAUD"
