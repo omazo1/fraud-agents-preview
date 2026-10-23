@@ -119,6 +119,20 @@ CLEAN_YES = re.compile(rf"^(?:{_YES_WORD}(?: {_YES_PHRASE})?|{_YES_PHRASE})$")
 CLEAN_NO = re.compile(rf"^(?:{_NO_WORD}(?: {_NO_PHRASE})?|{_NO_PHRASE})$")
 
 
+def accept_ai_label(ai_label: str, reply: str) -> tuple[str, str]:
+    """What the AI's reading of a reply is allowed to decide. Returns (label, who decided).
+
+    The AI never releases a payment on its own: an AI "confirmed" is treated as unclear
+    (the customer is asked again, then a human decides). An AI "denied" counts only if
+    the reply has no yes-word in it; mixed signals ("No problem, yes that was me") also
+    go to a human."""
+    if ai_label == "confirmed":
+        return "unclear", "AI said confirmed: a human decides"
+    if ai_label == "denied" and YES_SIGNAL.search(reply):
+        return "unclear", "AI said denied, but the reply also says yes: a human decides"
+    return ai_label, "AI"
+
+
 def keyword_label(text: str) -> str:
     """Plain rules, read before the AI: they decide ONLY a clean yes or a clean no.
 
@@ -219,16 +233,10 @@ class Verifier:
             except Exception as error:   # the AI failed: unclear (asked again, then a human)
                 log.warning("AI could not label %r (%s); keeping 'unclear'", state["reply"], error)
                 return {"label": "unclear", "labelled_by": "rules"}
-            if label == "denied" and YES_SIGNAL.search(state["reply"]):
-                # Mixed signals ("No problem, yes that was me"): a human decides, not the AI.
-                log.info("AI read %r as denied, but it also says yes: treated as unclear", state["reply"])
-                return {"label": "unclear", "labelled_by": "AI (mixed signals, needs a human)"}
-            if label == "confirmed":
-                # The AI never releases a payment on its own: a "yes" only the AI could read
-                # is treated as unclear, so the customer is asked again, then a human decides.
-                log.info("AI read %r as confirmed: treated as unclear (a human decides)", state["reply"])
-                return {"label": "unclear", "labelled_by": "AI (confirmed, needs a human)"}
-            return {"label": label, "labelled_by": "AI"}
+            label, labelled_by = accept_ai_label(label, state["reply"])
+            if label == "unclear" and labelled_by != "AI":
+                log.info("AI read %r: %s", state["reply"], labelled_by)
+            return {"label": label, "labelled_by": labelled_by}
 
         def after_read(state: State) -> Literal["ask_again", "finish"]:
             return "ask_again" if state["label"] == "unclear" and state["follow_ups"] < 1 else "finish"

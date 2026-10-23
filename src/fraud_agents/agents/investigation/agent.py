@@ -292,6 +292,8 @@ def ungrounded_numbers(report: dict, messages) -> list[str]:
         value = float(raw.replace(",", ""))
         places = len(raw.split(".")[1]) if "." in raw else 0
         candidates = source + ([s * 100 for s in source] if percent else [])
+        if places == 0:   # a whole number may round only a number of at least 1 ("1" is not 0.62)
+            candidates = [c for c in candidates if c >= 1 or c == value]
         if not any(abs(round(c, places) - value) < 1e-9 for c in candidates):
             missing.append(raw + percent)
     return missing

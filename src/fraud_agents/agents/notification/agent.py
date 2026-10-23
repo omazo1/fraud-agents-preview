@@ -102,6 +102,13 @@ CONTRADICTS = {
 }
 
 
+def is_replaced(r, outcome: TransactionResolved) -> bool:
+    """True if a later final outcome replaced this one (e.g. an analyst decided after
+    "reviewing" was sent): then no text, so the customer is never told something outdated."""
+    current = r.get(f"resolved:{outcome.txn_id}")   # the Decision agent's current final outcome
+    return bool(current) and current != outcome.event_id
+
+
 def template_text(key: str, amount: str, merchant: str) -> str:
     """The safe fixed text. A very long shop name is shortened so the text fits one SMS."""
     text = TEMPLATES[key].format(amount=amount, merchant=merchant)
@@ -219,8 +226,7 @@ def main() -> None:
     def handle(event):
         if not isinstance(event, TransactionResolved):
             raise ValueError(f"Expected transaction.resolved, got {event.event_type}")
-        current = r.get(f"resolved:{event.txn_id}")   # the Decision agent's current final outcome
-        if current and current != event.event_id:
+        if is_replaced(r, event):
             log.info("txn %s  %s skipped: a later outcome replaced it (e.g. an analyst's decision)",
                      event.txn_id[:8], event.payload.resolution)
             return

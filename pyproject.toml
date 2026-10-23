@@ -27,5 +27,14 @@ dependencies = [
     "psycopg-pool>=3.3,<4",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=9,<10"]          # install with: pip install -e ".[test]"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json"]                  # the Decision agent's rule files
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

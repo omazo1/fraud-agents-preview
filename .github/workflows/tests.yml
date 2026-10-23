@@ -1,0 +1,29 @@
+# Runs the automatic tests on GitHub for every push and pull request (Part 3 · Step 5).
+# No Docker Compose, Llama or dataset is needed: the tests use the saved model in models/
+# and a Redis service started here for the bus and gateway tests.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8.10.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install the project and pytest
+        run: pip install -e ".[test]"
+      - name: Run the tests
+        run: pytest -q

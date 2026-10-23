@@ -1,0 +1,145 @@
+# Fraud Agents: an event-driven, multi-agent AI fraud detection system
+
+A capstone project (Centennial College, COMP385) by **Omair Khan**.
+
+Card payments arrive as signed webhooks and become **events** on a Redis Streams bus. Small, independent **agents** each read the events they care about and publish new ones:
+
+- an XGBoost model scores every payment;
+- plain rules decide what happens;
+- AI agents (LangChain and LangGraph, with a local Llama model) investigate suspicious payments and text the customer;
+- a human analyst has the final say when the system can't decide.
+
+Every event is kept in a PostgreSQL audit log, and a Streamlit Monitor shows it all live.
+
+**The design rule:** *the AI advises, rules decide, and a human can override.* No AI output on its own can release a held payment.
+
+---
+
+## How a payment flows
+
+```
+replayer --signed webhook--> gateway --> Risk Scoring (XGBoost) --> Decision (rules)
+                                                                     approve | flag | hold
+                                                                             | flag or hold
+                                                                             v
+   Investigation (AI: LangGraph, 3 tools, checked report)
+      --> Verification (AI + rules: texts the customer, pauses until the reply, saved in PostgreSQL)
+             <--signed reply webhook-- mock SMS provider (simulated customer)
+      --> Decision (final-outcome rules): blocked | released | sent_to_analyst
+      --> Notification (AI draft, rule check, safe template fallback) --SMS--> customer
+   Analyst page (Monitor) --case.reviewed--> Decision --> final outcome --> Notification
+
+every event --> audit log (PostgreSQL) --> Fraud System Monitor (Streamlit)
+every AI call --> llm_calls table
+```
+
+| Program | What it does | Technology |
+| --- | --- | --- |
+| Gateway | Receives signed payment webhooks and customer-reply webhooks; replaces card numbers with keyed tokens; refuses the dataset's answer key | FastAPI, HMAC-SHA256 |
+| Risk Scoring agent | Scores every payment from 0 to 1 and gives the top reasons | XGBoost, SHAP values |
+| Decision agent | Plain rules: hold ≥ 0.90, flag ≥ 0.50, otherwise approve; later the final outcome | Python rules in JSON files |
+| Investigation agent | Uses tools on the card's history and the shop type, then writes a checked report | LangGraph, LangChain tools, Llama 3.1 8B |
+| Verification agent | Texts the customer, **pauses** until the reply (or a timeout), reads the reply | LangGraph `interrupt()` + PostgreSQL checkpointer |
+| Notification agent | Writes the outcome text; plain rules check it; a fixed template if it fails | LangGraph, Llama |
+| Audit log | Records every event | PostgreSQL |
+| Mock SMS provider | Pretends to be the SMS company and the customer | FastAPI, signed webhooks |
+| Monitor | Monitor, Payment trace, Caught payments, SMS inbox, Analyst pages | Streamlit |
+
+---
+
+## Run it on a Mac
+
+**You need:** Python 3.13, Docker Desktop, [Ollama](https://ollama.com/download), Homebrew and the [Kaggle credit card fraud dataset](https://www.kaggle.com/datasets/kartik2112/fraud-detection).
+
+```bash
+# 1. Get the code and the Python libraries
+git clone https://github.com/omazo1/fraud-agents.git && cd fraud-agents
+python3.13 -m venv .venv && source .venv/bin/activate   # Python 3.12 or newer
+brew install libomp                      # needed by XGBoost on a Mac
+pip install -e ".[test]"
+
+# 2. The dataset (not in Git): put fraudTrain.csv and fraudTest.csv in data/raw/
+mkdir -p data/raw                        # then move the two CSV files from Kaggle here
+
+# 3. Secrets (not in Git): copy the example, then make real values
+cp .env.example .env                     # then replace every "change-me" with: openssl rand -hex 32
+
+# 4. One-time setup
+docker compose up -d                     # Redis and PostgreSQL
+ollama pull llama3.1:8b                  # the local AI model (about 4.9 GB)
+python -m fraud_agents.agents.investigation.history   # loads the card history (about 1.85M payments)
+
+# 5. Start everything (Docker, Ollama and the 9 programs) and open the Monitor
+bash scripts/start_all.sh
+open http://localhost:8501
+```
+
+- `start_all.sh` is written for a Mac. `SKIP_DOCKER=1` or `SKIP_OLLAMA=1` in front of it skips starting those.
+- In the Monitor, press **▶ Start replay** to send real payments from the test set through the system.
+- `bash scripts/status.sh` shows what is running.
+- `bash scripts/stop_all.sh` stops everything.
+- Logs are in `data/logs/`.
+
+The trained model is saved in `models/`. To train it again: `python -m fraud_agents.agents.risk_scoring.train`.
+
+**Measure a run:** after a replay finishes (the Monitor's banner turns green), run `python -m fraud_agents.services.metrics.report`. It writes the headline numbers to `data/processed/run_report_<time>.md`. The answer key is used only by this report and the Monitor's testing pages; the agents never see it.
+
+## Tests
+
+```bash
+pytest                 # about 125 tests in a few seconds
+```
+
+- The tests need no Llama and no dataset. The bus, gateway and outcome-rule tests need Redis (`docker compose up -d`) and skip themselves without it. They use a separate Redis database (15), so they never touch a running system.
+- GitHub runs them on every push (`.github/workflows/tests.yml`).
+
+They cover:
+- the event forms;
+- signed webhooks and card tokens;
+- the Decision rules;
+- reading customer replies;
+- the rules every customer text must pass;
+- what may release a flagged payment;
+- the outcome rules (the first final outcome wins; an analyst can replace only a waiting case; no outdated texts);
+- the model;
+- the bus (duplicates, failures handed to a human);
+- the gateway.
+
+## Project layout
+
+```
+src/fraud_agents/
+  shared/      events.py (the 11 event forms), bus.py (Redis Streams), db.py, llm.py, signing.py, cards.py, config.py
+  agents/      risk_scoring/, decision/, investigation/, verification/, notification/
+  services/    gateway/, replayer/, audit/, sms/, metrics/ (the run report)
+  monitor/     app.py (the Streamlit Monitor)
+models/        the trained XGBoost model and its details
+scripts/       start_all.sh, status.sh, stop_all.sh
+tests/         the automatic tests
+```
+
+## Safety choices (and their limits)
+
+- **Rules decide, the AI advises.**
+  - A **held** payment is never released by an AI: it needs the customer's clear "yes" (read by plain rules) or an analyst.
+  - A customer's reply is decided by plain rules only when it is a clean yes or no. When the AI has to read a reply, its "yes" is not enough: a human decides. Its "no" counts only if the reply has no yes-word.
+  - A **flagged** (lower-risk) payment can be released when the Investigation agent recommends "no further action". That counts only if its verdict is "likely genuine", every piece of evidence states a number, and every number in its report (small rounding allowed) is found in the tool results. Otherwise the customer is asked.
+- **No case is lost.** If an agent keeps failing on a flagged or held payment, the payment goes to the analyst queue before the failed event is set aside.
+- **No double effects.**
+  - Every event has a stable ID, and every reader skips a repeat.
+  - Every text carries an idempotency key.
+  - Each payment gets one final outcome; an analyst can replace only a "sent to an analyst" one.
+- **Privacy.**
+  - Card numbers become keyed tokens at the gateway.
+  - Secrets live only in `.env`.
+  - The answer key is refused at the gateway.
+- **Known limits.**
+  - The model alone catches about two thirds of frauds at the 0.5 line (Part 1 test: 1,427 of 2,145), and it under-scores large online purchases.
+  - The checks catch made-up numbers, not wrong reasoning.
+  - Word lists for unsafe texts are never complete; the fixed template is the safety net.
+  - A local 8B model handles one investigation at a time, so the AI checks queue up under load.
+
+## Credits
+
+- Dataset: "Credit Card Transactions Fraud Detection Dataset" (simulated data) by kartik2112 on Kaggle.
+- Built step by step with Claude (Anthropic) as a coding partner; every step is recorded in the project's Build Book.

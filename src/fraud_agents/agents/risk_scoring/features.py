@@ -40,7 +40,7 @@ def make_features(payments: pd.DataFrame, categories: list[str]) -> pd.DataFrame
     out["amount"] = payments["amount"].astype(float)
     out["category"] = pd.Categorical(payments["category"], categories=categories)
     out["hour"] = when.dt.hour
-    out["day_of_week"] = when.dt.dayofweek
+    out["day_of_week"] = when.dt.day_of_week   # same values; "dayofweek" is deprecated in pandas 3
     out["distance_km"] = distance_km(
         payments["home_lat"], payments["home_long"],
         payments["merchant_lat"], payments["merchant_long"],

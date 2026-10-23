@@ -97,6 +97,45 @@ def is_analyst_case(outcome_event_id: str, txn_id: str) -> bool:
     return row[0] == txn_id and row[1] == "sent_to_analyst"
 
 
+def claim_final_outcome(r, txn_id: str, outcome_event_id: str) -> bool:
+    """One final outcome per payment: the first one wins (SET NX). True if this outcome may be
+    published: it is the first, or a retry of the one that won (same ID: readers skip it)."""
+    key = f"resolved:{txn_id}"
+    return bool(r.set(key, outcome_event_id, nx=True)) or r.get(key) == outcome_event_id
+
+
+def apply_review(r, review: CaseReviewed, new_outcome_id: str, latest_outcome=None,
+                 analyst_case=None) -> str:
+    """May this analyst review replace the payment's final outcome? Returns why or why not:
+    "apply" (swap done), "retry" (already applied: publish the same ID again),
+    "not_an_analyst_case" or "not_waiting" (ignored).
+
+    An analyst can replace ONLY a sent_to_analyst outcome of the same payment that is still
+    the current one. The swap is atomic (WATCH/MULTI); a WatchError means retry later."""
+    latest_outcome = latest_outcome or latest_outcome_id
+    analyst_case = analyst_case or is_analyst_case
+    key = f"resolved:{review.txn_id}"
+    case_id = review.payload.based_on_event_id
+    current = r.get(key)
+    if current == new_outcome_id:
+        return "retry"
+    if current != case_id and latest_outcome(review.txn_id) == case_id:
+        # The Redis note was lost (e.g. Redis was reset), but the audit log shows the case
+        # is still waiting for a human: restore the note instead of ignoring the review.
+        r.set(key, case_id)
+    if not analyst_case(case_id, review.txn_id):
+        return "not_an_analyst_case"
+    with r.pipeline() as pipe:
+        pipe.watch(key)
+        if pipe.get(key) != case_id:
+            pipe.unwatch()
+            return "not_waiting"
+        pipe.multi()
+        pipe.set(key, new_outcome_id)
+        pipe.execute()                 # raises WatchError if it changed meanwhile: retried
+    return "apply"
+
+
 def latest_outcome_id(txn_id: str) -> str | None:
     """The newest final outcome of a payment, from the audit log."""
     with db.connect() as conn:
@@ -168,8 +207,7 @@ def main() -> None:
             payload=TransactionResolvedPayload(resolution=resolution, rule_id=rule_id,
                                                rules_version=resolution_rules["rules_version"],
                                                based_on_event_id=event.event_id))
-        key = f"resolved:{event.txn_id}"
-        if r.set(key, resolved.event_id, nx=True) or r.get(key) == resolved.event_id:
+        if claim_final_outcome(r, event.txn_id, resolved.event_id):
             bus.publish(r, resolved)
             log.warning("txn %s  could not decide (%s): SENT_TO_ANALYST", event.txn_id[:8], reason[:120])
 
@@ -179,8 +217,7 @@ def main() -> None:
             return
         # One final outcome per payment: the first one wins (SET NX), later ones are ignored.
         # A retry of the winner finds its own ID there and publishes again (same ID: readers skip it).
-        key = f"resolved:{event.txn_id}"
-        if not r.set(key, resolved.event_id, nx=True) and r.get(key) != resolved.event_id:
+        if not claim_final_outcome(r, event.txn_id, resolved.event_id):
             log.info("txn %s  already has a final outcome: %s ignored", event.txn_id[:8], event.event_type)
             return
         bus.publish(r, resolved)
@@ -191,30 +228,15 @@ def main() -> None:
         if not isinstance(event, CaseReviewed):
             raise ValueError(f"Expected case.reviewed, got {event.event_type}")
         resolved = resolve(event, resolution_rules)
-        key = f"resolved:{event.txn_id}"
-        if r.get(key) != resolved.event_id and r.get(key) != event.payload.based_on_event_id \
-                and latest_outcome_id(event.txn_id) == event.payload.based_on_event_id:
-            # The Redis note was lost (e.g. Redis was reset), but the audit log shows the case
-            # is still waiting for a human: restore the note instead of ignoring the review.
-            r.set(key, event.payload.based_on_event_id)
-        if r.get(key) != resolved.event_id:   # not a retry of a review already applied
-            # The review must point at a "sent to an analyst" outcome of this same payment:
-            # an analyst can't flip a payment the rules already blocked or released.
-            if not is_analyst_case(event.payload.based_on_event_id, event.txn_id):
-                log.warning("txn %s  analyst review ignored: it doesn't point at a sent_to_analyst "
-                            "outcome of this payment", event.txn_id[:8])
-                return
-            # Swap the final outcome only if it is still the sent_to_analyst one being reviewed.
-            with r.pipeline() as pipe:
-                pipe.watch(key)
-                if pipe.get(key) != event.payload.based_on_event_id:
-                    pipe.unwatch()
-                    log.warning("txn %s  analyst review ignored: the case is not waiting for an analyst",
-                                event.txn_id[:8])
-                    return
-                pipe.multi()
-                pipe.set(key, resolved.event_id)
-                pipe.execute()                 # raises WatchError if it changed meanwhile: retried
+        verdict = apply_review(r, event, resolved.event_id)
+        if verdict == "not_an_analyst_case":
+            log.warning("txn %s  analyst review ignored: it doesn't point at a sent_to_analyst "
+                        "outcome of this payment", event.txn_id[:8])
+            return
+        if verdict == "not_waiting":
+            log.warning("txn %s  analyst review ignored: the case is not waiting for an analyst",
+                        event.txn_id[:8])
+            return
         bus.publish(r, resolved)               # a retry publishes the same ID again; readers skip it
         log.info("txn %s  FINAL (analyst %s): %-8s (%s)", event.txn_id[:8], event.payload.analyst,
                  resolved.payload.resolution.upper(), resolved.payload.rule_id)

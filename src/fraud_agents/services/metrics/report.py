@@ -23,6 +23,7 @@ from fraud_agents.shared import bus, db
 ANSWER_KEY_FILE = Path("data/raw/fraudTest.csv")
 OUT_DIR = Path("data/processed")
 RUN_KEY = "monitor:run"   # written by the Monitor when a run starts
+FAR_FUTURE = datetime(9999, 1, 1, tzinfo=timezone.utc)
 # Part 1 · Step 4: the model alone on the whole test file (555,719 payments) at the flag line (0.5).
 OFFLINE = {"caught": 1427, "frauds": 2145, "false_alarms": 397, "genuine": 553574}
 
@@ -51,17 +52,18 @@ def wilson(k: int, n: int) -> str:
     return f"{max(0, centre - half):.1%}–{min(1, centre + half):.1%}"
 
 
-def load(start: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load(start: datetime, until: datetime) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """The run's payments: those that ARRIVED between start and until, with all their events."""
+    in_run = ("SELECT txn_id FROM events WHERE event_type = 'transaction.received' "
+              "AND published_at >= %s AND published_at < %s")
     with db.connect() as conn:
         events = pd.DataFrame(conn.execute(
             "SELECT txn_id, event_type, producer, published_at, decision, score, body FROM events "
-            "WHERE txn_id IN (SELECT txn_id FROM events WHERE event_type = 'transaction.received' "
-            "                 AND published_at >= %s) ORDER BY published_at", (start,)).fetchall(),
+            f"WHERE txn_id IN ({in_run}) ORDER BY published_at", (start, until)).fetchall(),
             columns=["txn_id", "type", "producer", "at", "result", "score", "body"])
         calls = pd.DataFrame(conn.execute(
             "SELECT txn_id, agent, model, latency_ms, input_tokens, output_tokens, ok FROM llm_calls "
-            "WHERE called_at >= %s AND txn_id IN (SELECT txn_id FROM events WHERE "
-            "event_type = 'transaction.received' AND published_at >= %s)", (start, start)).fetchall(),
+            f"WHERE called_at >= %s AND txn_id IN ({in_run})", (start, start, until)).fetchall(),
             columns=["txn_id", "agent", "model", "ms", "tokens_in", "tokens_out", "ok"])
     events["body"] = [b if isinstance(b, dict) else json.loads(b) for b in events["body"]]
     return events, calls
@@ -78,8 +80,9 @@ def secs(series: pd.Series) -> str:
     return f"median {s.median():.1f} s · 95th percentile {s.quantile(0.95):.1f} s · max {s.max():.1f} s"
 
 
-def build(start: datetime, label: str, completed: datetime | None = None) -> str:
-    events, calls = load(start)
+def build(start: datetime, label: str, completed: datetime | None = None,
+          until: datetime = FAR_FUTURE) -> str:
+    events, calls = load(start, until)
     if events.empty:
         raise SystemExit("No payments arrived in this run yet.")
     key_df = pd.read_csv(ANSWER_KEY_FILE, usecols=["trans_num", "is_fraud"])
@@ -157,7 +160,8 @@ def build(start: datetime, label: str, completed: datetime | None = None) -> str
 
     r = bus.connect()
     start_ms = int(start.timestamp() * 1000)
-    dead = len(r.xrange(bus.DEAD_LETTER_STREAM, min=f"{start_ms}-0"))
+    end_ms = "+" if until == FAR_FUTURE else f"{int(until.timestamp() * 1000)}-0"
+    dead = len(r.xrange(bus.DEAD_LETTER_STREAM, min=f"{start_ms}-0", max=end_ms))
 
     lines = [
         f"# Run report: {start:%Y-%m-%d %H:%M:%S} UTC",
@@ -250,9 +254,17 @@ def build(start: datetime, label: str, completed: datetime | None = None) -> str
 def main() -> None:
     parser = argparse.ArgumentParser(description="Headline numbers for one run.")
     parser.add_argument("--since", help="start time (ISO, with time zone); default: the Monitor's current run")
+    parser.add_argument("--until", help="end time (ISO, with time zone): only payments that arrived before it")
     args = parser.parse_args()
     start, label, completed = run_start(args.since)
-    report = build(start, label, completed)
+    until = FAR_FUTURE
+    if args.until:
+        until = datetime.fromisoformat(args.until)
+        if until.tzinfo is None:
+            raise SystemExit("--until needs a time zone, e.g. 2026-10-22T23:30:00+00:00")
+        until = until.astimezone(timezone.utc)
+    report = build(start, label + (f" (payments that arrived before {until:%H:%M:%S} UTC)" if args.until else ""),
+                   completed, until)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out = OUT_DIR / f"run_report_{start:%Y%m%d_%H%M%S}.md"
     out.write_text(report)
