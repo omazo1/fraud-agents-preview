@@ -1,7 +1,11 @@
-"""The Risk Scoring agent (Part 1 · Step 5).
+"""The Risk Scoring agent (Part 1 · Step 5; model v2 with card history: feedback #4).
 
 Reads "payment arrived" forms (transaction.received), scores each payment with the
 trained model, and publishes an "I scored it" form (risk.scored).
+
+Model v2 also looks at the CARD'S OWN PAST: one indexed query to PostgreSQL's card_payments
+table (the bank's records, loaded by investigation/history.py) for the card's payments
+strictly before this one. It runs inside the gateway's 300 ms answer time, so it must stay fast.
 
 Run from the project folder:  python -m fraud_agents.agents.risk_scoring.agent
 Stop it with Ctrl + C.
@@ -14,8 +18,10 @@ from pathlib import Path
 import pandas as pd
 import xgboost as xgb
 
-from fraud_agents.agents.risk_scoring.features import FEATURES, make_features
-from fraud_agents.shared import bus
+import psycopg
+
+from fraud_agents.agents.risk_scoring.features import FEATURES, HISTORY_SQL, history_values, make_features
+from fraud_agents.shared import bus, db
 from fraud_agents.shared.events import (
     RiskScored,
     RiskScoredPayload,
@@ -26,24 +32,49 @@ from fraud_agents.shared.events import (
 
 PRODUCER = "risk-scoring"
 GROUP = "risk-scoring"
-MODEL_FILE = Path("models/risk_model_v1.json")
-META_FILE = Path("models/risk_model_v1.meta.json")
+MODEL_FILE = Path("models/risk_model_v2.json")
+META_FILE = Path("models/risk_model_v2.meta.json")
 
 log = logging.getLogger(PRODUCER)
+
+
+class CardHistory:
+    """The card's past, from PostgreSQL (one connection, reopened if it drops).
+
+    It runs inside the gateway's 300 ms answer time, so it gives up quickly: 1 s to connect,
+    150 ms per query (normally 1-5 ms). If it fails, the payment isn't scored yet: the gateway
+    answers a soft decline (no verdict in time) and the event is retried by the bus."""
+
+    def __init__(self, conn=None):
+        self.conn = conn                      # tests pass their own connection
+
+    def __call__(self, card_id: str, occurred_at, merchant: str, category: str, amount: float) -> dict:
+        args = {"card": card_id, "t": occurred_at, "merchant": merchant, "category": category}
+        for attempt in (1, 2):
+            try:
+                if self.conn is None or self.conn.closed:
+                    self.conn = db.connect(connect_timeout=1, statement_timeout_ms=150)
+                return history_values(amount, *self.conn.execute(HISTORY_SQL, args).fetchone())
+            except psycopg.OperationalError:
+                self.conn = None              # PostgreSQL restarted: reconnect once, then give up
+                if attempt == 2:
+                    raise
 
 
 class RiskScorer:
     """Loads the model once, then scores one payment at a time."""
 
-    def __init__(self, model_file: Path = MODEL_FILE, meta_file: Path = META_FILE):
+    def __init__(self, model_file: Path = MODEL_FILE, meta_file: Path = META_FILE, history=None):
         self.meta = json.loads(meta_file.read_text())
         self.model = xgb.XGBClassifier()
         self.model.load_model(model_file)
         self.booster = self.model.get_booster()
+        self.history = history or CardHistory()   # tests pass a stand-in (no database)
 
     def score(self, event: TransactionReceived) -> RiskScored:
         p = event.payload
-        row = pd.DataFrame([{
+        past = self.history(p.card_id, event.occurred_at, p.merchant, p.category, float(p.amount))
+        row = pd.DataFrame([past | {
             "occurred_at": event.occurred_at,
             "amount": float(p.amount),
             "category": p.category,

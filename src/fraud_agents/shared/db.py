@@ -39,8 +39,12 @@ CREATE INDEX IF NOT EXISTS llm_calls_txn_idx ON llm_calls (txn_id);
 """
 
 
-def connect() -> psycopg.Connection:
-    """Connect using the settings in .env (the same ones Docker Compose uses)."""
+def connect(connect_timeout: int | None = None, statement_timeout_ms: int | None = None) -> psycopg.Connection:
+    """Connect using the settings in .env (the same ones Docker Compose uses). The optional
+    timeouts are for callers that must answer quickly (the Risk Scoring agent)."""
+    options = "-c TimeZone=UTC"   # all times come back in UTC, like everywhere else
+    if statement_timeout_ms:
+        options += f" -c statement_timeout={statement_timeout_ms}"
     return psycopg.connect(
         host=os.environ.get("POSTGRES_HOST", "localhost"),
         port=int(os.environ.get("POSTGRES_PORT", "5432")),
@@ -48,7 +52,8 @@ def connect() -> psycopg.Connection:
         password=config.require("POSTGRES_PASSWORD"),
         dbname=config.require("POSTGRES_DB"),
         autocommit=True,
-        options="-c TimeZone=UTC",  # all times come back in UTC, like everywhere else
+        options=options,
+        **({"connect_timeout": connect_timeout} if connect_timeout else {}),
     )
 
 

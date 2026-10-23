@@ -19,9 +19,9 @@ sequenceDiagram
     Note over G: Check signature · card number → token · refuse the answer key · start waiting
     G->>B: XADD → events:transaction.received
     B->>RS: transaction.received
-    RS->>B: risk.scored (score 0–1 + top SHAP reasons)
+    RS->>B: risk.scored (score 0–1 + top SHAP reasons; reads the card's past in PostgreSQL)
     B->>D: risk.scored
-    D->>B: transaction.decided: approve (< 0.50) · flag (≥ 0.50) · hold (≥ 0.90)
+    D->>B: transaction.decided: approve (< 0.15) · flag (≥ 0.15) · hold (≥ 0.90)
     B->>G: transaction.decided (the gateway subscribes too)
     G-->>R: 200 approved · or declined (soft): "verify with customer" · no verdict in time → soft decline
     Note over D: approve → finished here

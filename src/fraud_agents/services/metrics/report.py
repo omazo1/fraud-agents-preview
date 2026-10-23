@@ -40,7 +40,9 @@ def offline_test() -> dict:
     frauds = meta["test"]["fraud_rows"]
     return {"model": meta["model_version"], "flag_at": flag_at, "caught": line["caught"],
             "frauds": frauds, "false_alarms": line["false_alarms"],
-            "genuine": meta["test"]["rows"] - frauds}
+            "genuine": meta["test"]["rows"] - frauds,
+            "fraud_cards": line.get("fraud_cards"), "first_fraud_caught": line.get("first_fraud_caught"),
+            "money_before_first_alarm": line.get("fraud_money_before_first_alarm")}
 
 
 def precision_at(rate: float, recall: float, false_alarm_rate: float) -> float:
@@ -69,6 +71,11 @@ def real_rate_section(off: dict, run_fraud: int, run_total: int, test_days: floa
         f"| {recall:.1%} ({off['caught']:,} of {off['frauds']:,}) | **{per_million:,.0f}** (95% range"
         f" {lo * 1e6:,.0f}–{hi * 1e6:,.0f}) | {precision_at(test_rate, recall, far):.1%} |",
         "",
+        *([f"- **Fraud comes in bursts** (a stolen card is used again and again), so many catches are"
+            f" later payments of a burst. What matters most is the first one: the first fraud was caught"
+            f" on **{off['first_fraud_caught']} of {off['fraud_cards']} cards**, and"
+            f" ${off['money_before_first_alarm']:,.0f} of fraud got through before a card's first alarm."]
+          if off.get("first_fraud_caught") is not None else []),
         "- **Precision falls as fraud gets rarer:** "
         + "; ".join(f"at {r:.1%} fraud, {precision_at(r, recall, far):.0%} of stopped payments are fraud"
                     for r in REAL_RATES) + ".",

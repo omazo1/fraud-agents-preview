@@ -8,9 +8,18 @@ The answer key (is_fraud) is NOT copied into card_payments.
 category_stats holds each shop type's historical fraud rate, from fraudTrain.csv only
 (the past), like a bank's record of confirmed fraud cases.
 
+Feedback #4: the Risk Scoring agent (model v2) also reads card_payments, for the card's
+past, inside the gateway's 300 ms answer time. A covering index (card, time + amount, shop,
+shop type) lets PostgreSQL answer from the index alone: about 1-3 ms instead of up to
+hundreds of ms.
+
 Run from the project folder:  python -m fraud_agents.agents.investigation.history
+Only add the fast index to an existing table:  ... history --index-only
+Stop the agents first (bash scripts/stop_all.sh): a full reload drops and rebuilds the table
+the Risk Scoring and Investigation agents read.
 """
 
+import argparse
 import io
 import time
 
@@ -46,7 +55,26 @@ CREATE TABLE category_stats (
 """
 
 
+INDEX = ("CREATE INDEX IF NOT EXISTS card_payments_history ON card_payments "
+         "(card_id, occurred_at) INCLUDE (amount, merchant, category)")
+
+
+def add_index(conn) -> None:
+    """The covering index, then VACUUM ANALYZE so PostgreSQL can use it on its own."""
+    conn.execute("DROP INDEX IF EXISTS card_payments_card_time")   # the old one; this one covers it
+    conn.execute(INDEX)
+    conn.execute("VACUUM ANALYZE card_payments")
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--index-only", action="store_true", help="only add the fast index")
+    if parser.parse_args().index_only:
+        start = time.time()
+        with db.connect() as conn:
+            add_index(conn)
+        print(f"Index ready in {time.time() - start:.0f} s.")
+        return
     start = time.time()
     print("Reading the dataset ...")
     frames = [pd.read_csv(f, usecols=COLUMNS, dtype={"cc_num": str}) for f in FILES]
@@ -81,13 +109,12 @@ def main() -> None:
                 buffer = io.StringIO()
                 out.iloc[chunk_start:chunk_start + 200_000].to_csv(buffer, header=False, index=False)
                 copy.write(buffer.getvalue())
-        conn.execute("CREATE INDEX card_payments_card_time ON card_payments (card_id, occurred_at)")
         with conn.cursor().copy(
             "COPY category_stats (category, payments, fraud_rate, median_amount) FROM STDIN"
         ) as copy:
             for row in stats.itertuples(index=False):
                 copy.write_row(tuple(row))
-        conn.execute("ANALYZE card_payments")
+        add_index(conn)
         rows = conn.execute("SELECT count(*), count(DISTINCT card_id) FROM card_payments").fetchone()
 
     print(f"Done in {time.time() - start:.0f} s: {rows[0]:,} payments, {rows[1]:,} cards, "

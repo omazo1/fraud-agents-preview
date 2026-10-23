@@ -21,5 +21,6 @@ def test_the_95_percent_range_contains_the_measured_rate():
 
 def test_the_offline_numbers_come_from_the_live_models_test_at_the_flag_line():
     off = offline_test()
-    assert off["flag_at"] == 0.5
+    from fraud_agents.agents.decision.agent import load_rules
+    assert off["flag_at"] == load_rules()["flag_at"]
     assert 0 < off["caught"] <= off["frauds"] and off["genuine"] > 500_000

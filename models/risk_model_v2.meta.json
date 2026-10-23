@@ -1,0 +1,169 @@
+{
+  "model_version": "risk_model_v2",
+  "trained_at": "2026-10-23T16:23:48+00:00",
+  "features": [
+    "amount",
+    "category",
+    "hour",
+    "day_of_week",
+    "distance_km",
+    "city_pop",
+    "card_history_n",
+    "amount_vs_card_avg",
+    "amount_vs_card_max",
+    "card_payments_1h",
+    "card_spend_24h",
+    "new_merchant",
+    "card_category_n",
+    "amount_vs_card_category_avg"
+  ],
+  "categories": [
+    "entertainment",
+    "food_dining",
+    "gas_transport",
+    "grocery_net",
+    "grocery_pos",
+    "health_fitness",
+    "home",
+    "kids_pets",
+    "misc_net",
+    "misc_pos",
+    "personal_care",
+    "shopping_net",
+    "shopping_pos",
+    "travel"
+  ],
+  "trees": 468,
+  "trained_on": "data/raw/fraudTrain.csv (first 90% by time; last 10% used for early stopping)",
+  "tested_on": "data/raw/fraudTest.csv (after the training data in time)",
+  "card_history": "each card's strictly earlier payments in both files (card_payments table when live)",
+  "validation": {
+    "rows": 129668,
+    "fraud_rows": 832,
+    "roc_auc": 0.9992,
+    "pr_auc": 0.9601,
+    "at_threshold": {
+      "0.1": {
+        "caught": 753,
+        "missed": 79,
+        "false_alarms": 97,
+        "fraud_cards": 88,
+        "first_fraud_caught": 71,
+        "fraud_money_before_first_alarm": 14383.73
+      },
+      "0.15": {
+        "caught": 736,
+        "missed": 96,
+        "false_alarms": 68,
+        "fraud_cards": 88,
+        "first_fraud_caught": 70,
+        "fraud_money_before_first_alarm": 16943.54
+      },
+      "0.2": {
+        "caught": 724,
+        "missed": 108,
+        "false_alarms": 54,
+        "fraud_cards": 88,
+        "first_fraud_caught": 67,
+        "fraud_money_before_first_alarm": 18869.29
+      },
+      "0.3": {
+        "caught": 708,
+        "missed": 124,
+        "false_alarms": 32,
+        "fraud_cards": 88,
+        "first_fraud_caught": 64,
+        "fraud_money_before_first_alarm": 20948.25
+      },
+      "0.5": {
+        "caught": 669,
+        "missed": 163,
+        "false_alarms": 14,
+        "fraud_cards": 88,
+        "first_fraud_caught": 58,
+        "fraud_money_before_first_alarm": 27731.87
+      },
+      "0.7": {
+        "caught": 636,
+        "missed": 196,
+        "false_alarms": 7,
+        "fraud_cards": 88,
+        "first_fraud_caught": 57,
+        "fraud_money_before_first_alarm": 30286.93
+      },
+      "0.9": {
+        "caught": 559,
+        "missed": 273,
+        "false_alarms": 1,
+        "fraud_cards": 88,
+        "first_fraud_caught": 52,
+        "fraud_money_before_first_alarm": 44944.73
+      }
+    }
+  },
+  "test": {
+    "rows": 555719,
+    "fraud_rows": 2145,
+    "roc_auc": 0.9987,
+    "pr_auc": 0.9245,
+    "at_threshold": {
+      "0.1": {
+        "caught": 1846,
+        "missed": 299,
+        "false_alarms": 399,
+        "fraud_cards": 218,
+        "first_fraud_caught": 167,
+        "fraud_money_before_first_alarm": 32745.24
+      },
+      "0.15": {
+        "caught": 1804,
+        "missed": 341,
+        "false_alarms": 284,
+        "fraud_cards": 218,
+        "first_fraud_caught": 163,
+        "fraud_money_before_first_alarm": 38321.87
+      },
+      "0.2": {
+        "caught": 1756,
+        "missed": 389,
+        "false_alarms": 207,
+        "fraud_cards": 218,
+        "first_fraud_caught": 159,
+        "fraud_money_before_first_alarm": 43417.72
+      },
+      "0.3": {
+        "caught": 1696,
+        "missed": 449,
+        "false_alarms": 140,
+        "fraud_cards": 218,
+        "first_fraud_caught": 148,
+        "fraud_money_before_first_alarm": 56879.16
+      },
+      "0.5": {
+        "caught": 1610,
+        "missed": 535,
+        "false_alarms": 87,
+        "fraud_cards": 218,
+        "first_fraud_caught": 138,
+        "fraud_money_before_first_alarm": 69479.54
+      },
+      "0.7": {
+        "caught": 1502,
+        "missed": 643,
+        "false_alarms": 48,
+        "fraud_cards": 218,
+        "first_fraud_caught": 133,
+        "fraud_money_before_first_alarm": 78420.36
+      },
+      "0.9": {
+        "caught": 1295,
+        "missed": 850,
+        "false_alarms": 12,
+        "fraud_cards": 218,
+        "first_fraud_caught": 121,
+        "fraud_money_before_first_alarm": 108610.57
+      }
+    }
+  },
+  "xgboost_version": "3.4.1"
+}

@@ -20,8 +20,8 @@ def label(**payload):
     return dict(event_id=new_event_id(), published_at=now_utc(), txn_id="t1", occurred_at=now_utc(), **payload)
 
 
-@pytest.mark.parametrize("score, decision", [(0.10, "approve"), (0.50, "flag"), (0.89, "flag"),
-                                             (0.90, "hold"), (1.00, "hold")])
+@pytest.mark.parametrize("score, decision", [(0.10, "approve"), (0.149, "approve"), (0.15, "flag"),
+                                             (0.89, "flag"), (0.90, "hold"), (1.00, "hold")])
 def test_first_decision_lines(score, decision):
     scored = RiskScored(**label(payload=RiskScoredPayload(score=score, model_version="test")))
     assert decide(scored, RULES).payload.decision == decision

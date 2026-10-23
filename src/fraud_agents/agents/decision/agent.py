@@ -1,7 +1,8 @@
 """The Decision agent (Part 1 · Step 6, extended in Part 2 · Step 6). Plain rules, no AI.
 
 1. First decision: reads "I scored it" forms (risk.scored) and publishes "I decided"
-   forms (transaction.decided): approve, flag or hold. The lines live in rules_v1.json.
+   forms (transaction.decided): approve, flag or hold. The lines live in rules_v2.json
+   (flag at 0.15 for model v2, chosen on the validation slice; see its note).
    The gateway turns this into the answer at the till (feedback #2): approve = approved;
    flag or hold = a SOFT decline (declined for now, the customer is asked, and a retry is
    approved if they confirm). A retry the customer confirmed is always approved.
@@ -42,7 +43,7 @@ from fraud_agents.shared.events import (
 
 PRODUCER = "decision"
 GROUP = "decision"
-RULES_FILE = Path(__file__).with_name("rules_v1.json")
+RULES_FILE = Path(__file__).with_name("rules_v2.json")
 RESOLUTION_FILE = Path(__file__).with_name("resolution_rules_v1.json")
 
 log = logging.getLogger(PRODUCER)
